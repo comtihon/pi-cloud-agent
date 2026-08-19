@@ -144,7 +144,7 @@ export function wantsExactResult(event) {
 // example for the mcp tool description that reflects the tools actually
 // configured for a given run (never hardcoded to a tool that isn't present).
 const MCP_TOOL_EXAMPLES = {
-  jira_get_issue: { args: { issue_key: 'C130-1234' }, reason: 'need ticket description and acceptance criteria' },
+  jira_get_issue: { args: { issue_key: 'PROJ-1234' }, reason: 'need ticket description and acceptance criteria' },
   search: { args: { query: 'authentication flow', repo: '/workspace/REPO' }, reason: 'find where auth is implemented before making changes' },
   find_related: { args: { file_path: 'src/auth.py', line: 42, repo: '/workspace/REPO' }, reason: 'find similar code elsewhere in the repo' },
   graphify_query: { args: { question: 'how does the mcp tool loop work', repo: '/workspace/REPO' }, reason: 'get a scoped subgraph answering a codebase question' },

@@ -28,7 +28,7 @@ test('buildMcpUsageExample: jira tool uses jira example correctly', () => {
   const s = buildMcpUsageExample(['jira: jira_get_issue'])
   assert.ok(s.includes('jira_get_issue'))
   assert.ok(s.includes('issue_key'))
-  assert.ok(s.includes('C130-1234'))
+  assert.ok(s.includes('PROJ-1234'))
 })
 
 test('buildMcpUsageExample: unknown tool → generic-but-real-tool-name fallback', () => {

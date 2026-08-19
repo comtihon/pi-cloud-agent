@@ -1,6 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { summarizeToolCallArgs, trackLargeToolCallArgs, trackLargeAssistantContent, cacheFrontierIndex } from '../src/runner.js'
+// summarizeToolCallArgs now lives in pi-post-compact (shared with the native
+// extension path); the trackers and the cache-frontier adapter are the
+// wire-shape pieces that stay in this repo.
+import { summarizeToolCallArgs } from 'pi-post-compact'
+import { trackLargeToolCallArgs, trackLargeAssistantContent, cacheFrontierIndex } from '../src/runner.js'
 
 test('summarizeToolCallArgs: write with path', () => {
   const s = summarizeToolCallArgs('write', JSON.stringify({ path: '/tmp/a.py', content: 'x' }))

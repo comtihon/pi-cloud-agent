@@ -22,28 +22,28 @@ import { promisify } from 'util'
 import { createAgentSession, AuthStorage, ModelRegistry, createReadTool, createEditTool, createWriteTool, createGrepTool, createFindTool, createLsTool } from '@earendil-works/pi-coding-agent'
 import { downloadWorkspace, uploadWorkspace, activateGcloudServiceAccount } from './workspaceS3.js'
 
-// pi-post-compact is NOT a dependency of this package (pi/package.json) —
-// it's installed by the Dockerfile into a separate npm project rooted at
-// $PI_CODING_AGENT_DIR/npm (default /root/.pi/agent/npm), alongside its own
-// peer deps (@earendil-works/pi-ai, @earendil-works/pi-coding-agent). A bare
-// `import 'pi-post-compact'` from here would NOT resolve (this file's
-// ancestor node_modules chain never includes that install root), so we
-// import from its known absolute runtime install path instead. Loaded
-// lazily/defensively — if anything about that layout ever changes, the
-// mcp-resolver loop's compaction step falls back to raw/truncated output
-// rather than crashing the run.
-let compactToolResult = null
-let loadConfig = null
-try {
-  const _agentDirForImport = process.env.PI_CODING_AGENT_DIR || '/root/.pi/agent'
-  const _postCompactPath = join(_agentDirForImport, 'npm', 'node_modules', 'pi-post-compact', 'dist', 'index.js')
-  const _postCompactMod = await import(_postCompactPath)
-  compactToolResult = _postCompactMod.compactToolResult
-  loadConfig = _postCompactMod.loadConfig
-  console.log('[pi-agent] pi-post-compact loaded OK, mcp-loop compaction enabled')
-} catch (e) {
-  console.warn('[pi-agent] pi-post-compact import failed, mcp-loop compaction disabled:', e.message)
-}
+// Compaction/collapse policy lives in pi-post-compact, shared with the native
+// pi extension path. Only the wire-shape adapters below stay here: this file
+// drives its own OpenAI-completions message array inside the mcp-resolver loop
+// (see the fetch interception in startRun), which never passes through pi's
+// agent loop and therefore never reaches the extension's `context` hook.
+//
+// It is a plain dependency (`file:vendor/pi-post-compact`), so this import is
+// static and cannot silently degrade. The Dockerfile ALSO installs the same
+// vendored package into $PI_CODING_AGENT_DIR/npm — that copy is what pi loads
+// as an extension for native tool calls, and is unrelated to this import.
+import {
+  buildActionSummaryInstruction,
+  cacheFrontierIndex as _cacheFrontierIndexBy,
+  compactOrKeep,
+  resolveMetaLlm,
+  summarizeToolCallArgs,
+  truncateWithNotice,
+  ASSISTANT_CONTENT_REASON,
+  DEFAULT_MIN_CHARS,
+} from 'pi-post-compact'
+
+export { summarizeToolCallArgs }
 
 // Module-level state shared between startRun() and _executeMcpTool()
 let _mcpHttpServers = {}   // name → {proc, port, url}
@@ -300,61 +300,34 @@ export function looksLikeFinalJson(text) {
 }
 
 // ── Cache-frontier bookkeeping (inert / observability only) ──────────────
-// Pure function: given the running `messages` array and iterables of
-// tool_call_ids still pending collapse — `pendingIds` are tool results
-// pending in _exactOnceTracked (whose content mutates in place on a later
-// turn), `pendingArgIds` are assistant tool_call ids pending in
-// _argCollapseTracked (whose arguments get replaced by a summary stub), and
-// `pendingMsgs` are assistant message OBJECT refs pending in
-// _contentCollapseTracked (whose plain-string content collapses in place) —
-// return the index of the FIRST message still pending any kind of
-// collapse. Everything strictly before that index is stable/cacheable; that
-// message and everything after it may still mutate. Returns messages.length
-// when nothing is pending.
+// Wire-shape adapter over pi-post-compact's cacheFrontierIndex. Given the
+// running `messages` array and iterables of tool_call_ids still pending
+// collapse — `pendingIds` are tool results pending in _exactOnceTracked (whose
+// content mutates in place on a later turn), `pendingArgIds` are assistant
+// tool_call ids pending in _argCollapseTracked (whose arguments get replaced by
+// a summary stub), and `pendingMsgs` are assistant message OBJECT refs pending
+// in _contentCollapseTracked (whose plain-string content collapses in place) —
+// return the index of the FIRST message still pending any kind of collapse.
+// Everything strictly before that index is stable/cacheable.
 // NOTE: this does NOT attach cache_control or alter any request — it is
 // log-only bookkeeping for a future caching pass.
 export function cacheFrontierIndex(messages, pendingIds, pendingArgIds = [], pendingMsgs = []) {
   const pending = pendingIds instanceof Set ? pendingIds : new Set(pendingIds)
   const pendingArgs = pendingArgIds instanceof Set ? pendingArgIds : new Set(pendingArgIds)
   const pendingMsgSet = pendingMsgs instanceof Set ? pendingMsgs : new Set(pendingMsgs)
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i]
-    if (pendingMsgSet.has(msg)) return i
-    if (msg.role === 'tool' && pending.has(msg.tool_call_id)) return i
-    if (msg.role === 'assistant' && Array.isArray(msg.tool_calls) && msg.tool_calls.some(tc => pendingArgs.has(tc.id))) return i
-  }
-  return messages.length
+  return _cacheFrontierIndexBy(messages, (msg) => {
+    if (pendingMsgSet.has(msg)) return true
+    if (msg.role === 'tool' && pending.has(msg.tool_call_id)) return true
+    if (msg.role === 'assistant' && Array.isArray(msg.tool_calls)
+      && msg.tool_calls.some(tc => pendingArgs.has(tc.id))) return true
+    return false
+  })
 }
 
-// ── Pure arg-collapse helpers ────────────────────────────────────────────
-// Build a one-sentence summary of an assistant tool_call's arguments, used
-// when collapsing large args in place to a stub after the model has reasoned
-// over them once.
-export function summarizeToolCallArgs(fnName, argsString) {
-  const chars = String(argsString ?? '').length
-  let args = null
-  try { args = JSON.parse(argsString) } catch { args = null }
-  if (fnName === 'write' && args?.path) return `wrote ${args.path} (${chars} chars)`
-  if (fnName === 'edit' && args?.path) {
-    let n = 1
-    if (Array.isArray(args.edits)) n = args.edits.length
-    else if (typeof args.edits === 'string') { try { const p = JSON.parse(args.edits); if (Array.isArray(p)) n = p.length } catch {} }
-    return `edited ${args.path} (${n} edit(s))`
-  }
-  if (fnName === 'bash' && typeof args?.command === 'string') {
-    const first = args.command.split('\n')[0].slice(0, 80)
-    let target = ''
-    const redirect = args.command.match(/>{1,2}\s*(\S+)/)
-    if (redirect) {
-      target = `, writes ${redirect[1]}`
-    } else {
-      const heredoc = args.command.match(/<<\s*['"]?(\w+)/)
-      if (heredoc) target = `, heredoc ${heredoc[1]}`
-    }
-    return `${first}${target}, ${chars} chars total`
-  }
-  return `${fnName} call, ${chars} chars`
-}
+// ── Wire-shape collapse trackers ─────────────────────────────────────────
+// summarizeToolCallArgs (the stub text) and the collapse timing rules live in
+// pi-post-compact. These two only locate collapse candidates in the OpenAI
+// chat-completions message shape this loop builds by hand.
 
 // Track assistant messages whose tool_call arguments exceed `threshold` chars,
 // so they can be collapsed in place to a summary stub on a later round-trip.
@@ -690,68 +663,39 @@ export async function startRun(body, client, setAbort) {
         // Route mcp/bash tool results through pi-post-compact's summarizer
         // before they re-enter the message array — raw, uncapped tool output
         // here previously caused one production run to burn 119,477 prompt
-        // tokens vs ~12k expected. exact:true (or missing compactToolResult
-        // import) skips compaction; below-threshold results skip it too
-        // (not worth an extra LLM round-trip). Any failure falls back to
-        // raw/truncated rather than dropping data.
-        const MIN_CHARS = Number(process.env.MCP_COMPACT_MIN_CHARS || 800)
-        const _maybeCompact = async (raw, { exact, reason }) => {
-          if (exact === true) {
-            console.log(`[pi-agent] compaction skipped (exact=true): ${reason}`)
-            return raw
+        // tokens vs ~12k expected.
+        const MIN_CHARS = Number(process.env.MCP_COMPACT_MIN_CHARS || DEFAULT_MIN_CHARS)
+        // modelRegistry here is ModelRegistry.inMemory(authStorage) from
+        // resolveModelConfig() in the enclosing startRun() closure — the SDK's own
+        // tool_result hook calls the same getApiKeyAndHeaders(model) method on its
+        // ctx.modelRegistry, so this is the same shape/contract.
+        const _compactDeps = {
+          metaLlm: resolveMetaLlm({ cwd: '/workspace' }),
+          modelRegistry,
+          minChars: MIN_CHARS,
+          log: (m) => console.log(`[pi-agent] ${m}`),
+        }
+        // Compaction policy (threshold, no-shrink guard, never-lose-data fallback)
+        // lives in pi-post-compact. This wrapper only adds what is local to this
+        // loop: accumulating the meta-LLM's own token cost into _metaUsageAcc
+        // (NOT _usageAcc/_addUsage) so it never mixes into the agent's own
+        // token_usage. Caveman-style one-sentence output is requested via the
+        // `style` option rather than smuggled through `reason`.
+        const _maybeCompact = async (raw, { exact, reason, prompt }) => {
+          const result = await compactOrKeep(
+            raw,
+            { exact, reason, prompt, style: 'caveman-one-sentence' },
+            _compactDeps,
+          )
+          const u = result.usage
+          if (u) {
+            const inp = u.input_tokens ?? u.prompt_tokens ?? 0
+            const out = u.output_tokens ?? u.completion_tokens ?? 0
+            _metaUsageAcc.input_tokens += inp
+            _metaUsageAcc.output_tokens += out
+            _metaUsageAcc.total_tokens += u.total_tokens ?? (inp + out)
           }
-          if (raw.length < MIN_CHARS) {
-            console.log(`[pi-agent] compaction skipped (${raw.length} chars < threshold): ${reason}`)
-            return raw
-          }
-          if (!compactToolResult) {
-            console.log(`[pi-agent] compaction unavailable, falling back to raw output: ${reason}`)
-            return raw
-          }
-          try {
-            const metaLlm = process.env.META_LLM_PROVIDER && process.env.META_LLM_MODEL
-              ? `${process.env.META_LLM_PROVIDER}/${process.env.META_LLM_MODEL}`
-              : ((loadConfig ? loadConfig('/workspace').meta_llm : null) || 'anthropic/claude-haiku-4-5')
-            // modelRegistry here is ModelRegistry.inMemory(authStorage) from
-            // resolveModelConfig() in the enclosing startRun() closure — the
-            // SDK's own tool_result hook calls the same getApiKeyAndHeaders(model)
-            // method on its ctx.modelRegistry, so this is the same shape/contract.
-            // compactToolResult's own prompt is fixed ("Focus on: ${reason}") —
-            // no parameter to restyle its output, so the style directive rides
-            // in the reason field itself. Caveman fragments are inherently
-            // denser than prose, which directly avoids cases like a plain `ls`
-            // listing turning into a longer natural-language description of it.
-            const cavemanReason = `${reason}. Respond with EXACTLY ONE short caveman-style sentence: no articles (a/an/the), no filler words, short fragments joined into a single line. Keep exact numbers/names/technical terms unchanged. Never use more than one sentence.`
-            const result = await compactToolResult(raw, { exact: false, reason: cavemanReason }, metaLlm, modelRegistry)
-            if (result?.text) {
-              // Meta-LLM cost for this compaction call — accumulate into the
-              // run-scoped _metaUsageAcc (NOT _usageAcc/_addUsage), so it never
-              // mixes into the agent's own token_usage. Usage shape from
-              // compactToolResult may be OpenAI-style (prompt_tokens/
-              // completion_tokens) or already input_tokens/output_tokens;
-              // normalize to the latter, with total falling back to input+output.
-              const u = result.usage
-              if (u) {
-                const inp = u.input_tokens ?? u.prompt_tokens ?? 0
-                const out = u.output_tokens ?? u.completion_tokens ?? 0
-                const tot = u.total_tokens ?? (inp + out)
-                _metaUsageAcc.input_tokens += inp
-                _metaUsageAcc.output_tokens += out
-                _metaUsageAcc.total_tokens += tot
-              }
-              if (result.text.length >= raw.length) {
-                console.log(`[pi-agent] compaction did not shrink output (${raw.length} -> ${result.text.length} chars), keeping raw: ${reason}`)
-                return raw
-              }
-              console.log(`[pi-agent] compacted tool result: ${raw.length} -> ${result.text.length} chars (reason: "${reason}")`)
-              return result.text
-            }
-          } catch (e) {
-            console.warn('[pi-agent] compaction failed:', e.message)
-          }
-          // fallback: never silently drop data — raw is still on disk as an artifact regardless
-          console.log(`[pi-agent] compaction failed/unavailable, falling back to raw output: ${reason}`)
-          return raw
+          return result.text
         }
 
         // kimi-k2 sometimes ignores tool_choice and returns stop — retry up to _mcpRetries times
@@ -815,8 +759,11 @@ export async function startRun(body, client, setAbort) {
         const _collapseUsedExactResults = async () => {
           for (const [id, e] of _exactOnceTracked) {
             if (_roundTrip <= e.roundTripCreated) continue  // not sent even once yet
-            const actionReason = `Answer in ONE short sentence: ${e.reason}. State only the specific finding — an exact line number, value, or "not found" — never a general description of the file/output.`
-            e.msg.content = await _maybeCompact(e.msg.content, { exact: false, reason: actionReason })
+            e.msg.content = await _maybeCompact(e.msg.content, {
+              exact: false,
+              reason: e.reason,
+              prompt: buildActionSummaryInstruction(e.reason),
+            })
             _exactOnceTracked.delete(id)
             console.log('[pi-agent] collapsed exact tool result to action summary after one use:', id, `(reason: "${e.reason}")`)
           }
@@ -851,7 +798,7 @@ export async function startRun(body, client, setAbort) {
               mkdirSync(ARTIFACT_DIR, { recursive: true })
               writeFileSync(join(ARTIFACT_DIR, `${id}-content.txt`), original)
             } catch (err) { console.warn('[pi-agent] content artifact write failed:', id, err.message) }
-            const summary = await _maybeCompact(original, { exact: false, reason: 'assistant reasoning turn — preserve decisions, findings, chosen approach, and any file paths or values' })
+            const summary = await _maybeCompact(original, { exact: false, reason: ASSISTANT_CONTENT_REASON })
             _contentCollapseTracked.delete(id)
             if (summary === original) { console.log('[pi-agent] assistant content collapse skipped (no shrink):', id); continue }
             e.msg.content = `[collapsed: ${summary} — full text: read_artifact "${id}-content"]`
@@ -994,10 +941,11 @@ export async function startRun(body, client, setAbort) {
             // at read_artifact for the rest. Applied BEFORE _maybeCompact so both
             // the exact path and the summarizer input are bounded equally.
             let _forCompact = _rawResult
-            if (_forCompact.length > TOOL_RESULT_MAX_CHARS) {
-              _forCompact = _forCompact.slice(0, TOOL_RESULT_MAX_CHARS) +
-                `\n…[truncated, ${_rawResult.length} total chars — full output saved as artifact "${_artifactId}", use read_artifact({artifact_id:"${_artifactId}"}) if you need the rest]`
-            }
+            _forCompact = truncateWithNotice(
+              _forCompact,
+              TOOL_RESULT_MAX_CHARS,
+              `\n…[truncated, ${_rawResult.length} total chars — full output saved as artifact "${_artifactId}", use read_artifact({artifact_id:"${_artifactId}"}) if you need the rest]`,
+            )
 
             const injected = await _maybeCompact(_forCompact, { exact, reason })
             const _toolMsg = { role: 'tool', tool_call_id: toolCall.id, content: injected }

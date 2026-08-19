@@ -1,35 +1,10 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-interface PostCompactConfig {
-    meta_llm?: string;
-}
-export declare function loadConfig(cwd: string): PostCompactConfig;
-export declare function parseMetaLlm(metaLlm: string): {
-    provider: string;
-    model: string;
-} | undefined;
-interface ModelRegistryLike {
-    getApiKeyAndHeaders(model: unknown): Promise<{
-        ok: boolean;
-        apiKey?: string;
-        headers?: unknown;
-    }>;
-}
-/**
- * Summarize `text` via the configured meta-LLM, focused on `opts.reason`.
- * Returns `undefined` on any failure or empty summary — never throws
- * ("never break the agent"), matching the original inline tool_result hook
- * behavior this was extracted from.
- */
-export declare function compactToolResult(text: string, opts: {
-    exact: boolean;
-    reason: string;
-}, metaLlm: string, modelRegistry: ModelRegistryLike): Promise<{
-    text: string;
-    usage?: {
-        prompt_tokens: number;
-        completion_tokens: number;
-        total_tokens: number;
-    };
-} | undefined>;
+export { ASSISTANT_CONTENT_REASON, buildActionSummaryInstruction, compactOrKeep, compactToolResult, DEFAULT_META_LLM, DEFAULT_MIN_CHARS, loadConfig, parseMetaLlm, resolveMetaLlm, STYLE_GUIDES, } from "./compact.js";
+export type { CompactOrKeepDeps, CompactOrKeepResult, CompactSkipReason, CompactStyle, CompactToolResultOptions, CompactUsage, ModelRegistryLike, PostCompactConfig, PostCompactDirective, } from "./compact.js";
+export { cacheFrontierIndex, CollapseTracker, DEFAULT_COLLAPSE_DELAY, summarizeToolCallArgs, truncateWithNotice, } from "./collapse.js";
+export type { CollapseEntry } from "./collapse.js";
+export { collapseStub, createArtifactStore, DEFAULT_ARTIFACT_DIRNAME, sanitizeArtifactId, } from "./artifacts.js";
+export type { ArtifactStore } from "./artifacts.js";
+export { ContextCollapseEngine } from "./context-collapse.js";
+export type { ContextCollapseOptions, ContextCollapseStats } from "./context-collapse.js";
 export default function postCompactExtension(pi: ExtensionAPI): void;
-export {};

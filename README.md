@@ -55,38 +55,61 @@ carrier ──POST /start──▶ pi-cloud-agent ──▶ pi SDK session (tool
 ## Token consumption optimizations
 
 A long agent run spends most of its tokens re-sending old tool output. This image cuts that down
-without losing the information the model actually needs:
+without losing the information the model actually needs.
 
-- **Post-hoc tool-result compaction** — `mcp` and `bash` results are summarized by a cheap meta-LLM
-  via [pi-post-compact](https://github.com/comtihon/pi-post-compact) instead of being carried
-  verbatim. Results marked `exact: true`, or shorter than the threshold, skip compaction; if the
-  summary would not shrink the output, the raw text is kept. Meta-LLM cost is accumulated per run
-  and reported.
-- **Exact-result collapse after first use** — a result the model needed verbatim is kept verbatim
-  for exactly one turn, then collapsed in place to a short action summary.
-- **Tool-call argument collapse** — large assistant tool-call arguments (a full file body in a
-  `write`, for instance) are replaced by a one-sentence stub once the call has been answered.
-- **Assistant content collapse** — oversized assistant messages collapse in place on later turns.
-- **Hard result ceiling** — anything still oversized after the above is truncated.
-- **Cache-frontier bookkeeping** — tracks the first message still subject to in-place mutation, so
-  everything before it is stable and prompt-cacheable. Currently observability only; it does not
-  attach `cache_control` yet.
+The policy itself — thresholds, prompts, collapse timing, artifact handling — lives in
+[**pi-post-compact**](https://github.com/comtihon/pi-post-compact), which is both a pi extension and
+a library. That split is deliberate, because this image reduces tokens along two paths that share
+one implementation:
+
+| Path | Used for | Driven by |
+|---|---|---|
+| pi extension (`tool_result` + `context` hooks) | native pi tool calls | pi's own agent loop |
+| direct library calls | the `mcp` gateway loop below | `src/runner.js` |
+
+The gateway loop drives its own provider requests and never passes through pi's agent loop, so the
+extension's hooks never fire for it — hence the second consumer. Same code, same behavior.
+
+### What it does
+
+- **Tool-result compaction** — `mcp` and `bash` results are summarized by a cheap meta-LLM focused on
+  a caller-declared `reason`, instead of being carried verbatim. Results marked `exact: true`, or
+  shorter than the threshold, skip it; if the summary would not shrink the output, the raw text is
+  kept. Meta-LLM cost is accumulated per run and reported separately from the agent's own usage.
+- **Verbatim results collapse after first use** — a result the model needed verbatim is kept verbatim
+  for exactly one round-trip, then replaced by a one-sentence *finding* ("what did I learn"), which
+  compresses far harder than a description of the same output.
+- **Tool-call argument collapse** — large arguments (a full file body in a `write`) are replaced by a
+  lexical stub once the call has run. No LLM involved.
+- **Assistant content collapse** — oversized assistant messages collapse on later round-trips.
+- **Hard result ceiling** — anything still oversized is truncated.
 - **Single `mcp` gateway tool** — every MCP server's tools are reached through one
   `mcp({tool, args, reason})` tool whose description is a flat name list (capped at 60), instead of
   injecting a full JSON schema per tool into every request. The usage example is generated from the
-  tools actually configured for the run.
+  tools actually configured for the run. This part is specific to this image.
+- **Cache-frontier bookkeeping** — tracks the first message still subject to rewriting, so everything
+  before it is stable and prompt-cacheable. Observability only; it does not attach `cache_control`.
 
-Tunables (all optional, defaults shown):
+Displaced originals are written to `/workspace/.tool_artifacts` and named in the stub that replaces
+them, so nothing is unrecoverable — `read_artifact` inside the gateway loop, or an ordinary `read`
+on the native path.
+
+Note the tension: rewriting history invalidates a provider's cached prefix from the first rewritten
+message onward. The collapse delay bounds it, but on a provider you rely on for prompt caching this
+is worth measuring rather than assuming.
+
+### Tunables
 
 | Env var                        | Default | Effect |
 | ------------------------------ | ------- | ------ |
-| `MCP_COMPACT_MIN_CHARS`        | `800`   | Below this, a tool result is not sent to the compactor. |
+| `MCP_COMPACT_MIN_CHARS`        | `800`   | Below this, a gateway-loop tool result is not summarized. |
 | `MCP_ARG_COLLAPSE_MIN_CHARS`   | `800`   | Below this, tool-call arguments are left alone. |
 | `MCP_TOOL_RESULT_MAX_CHARS`    | `20000` | Hard truncation ceiling for a tool result. |
-| `MCP_RESOLVER_CALL_TIMEOUT_MS` | —       | Timeout for a resolver call. |
+| `MCP_RESOLVER_CALL_TIMEOUT_MS` | `120000` | Timeout for one chained call in the gateway loop. |
+| `META_LLM_PROVIDER` / `META_LLM_MODEL` | — | Model used for summaries. Falls back to `anthropic/claude-haiku-4-5`. |
 
-If `pi-post-compact` cannot be loaded, compaction is disabled and the run falls back to
-raw/truncated output rather than failing.
+If `pi-post-compact` cannot summarize — no credentials, provider error, empty response — every path
+falls back to the raw text rather than losing data.
 
 ---
 
@@ -162,7 +185,9 @@ config and existing k8s Secrets).
 ```
 src/            HTTP server, pi SDK runner, backend client, GCS workspace helpers
 test/           node:test suites
-vendor/         pi-post-compact, installed into the pi agent home by the Dockerfile
+vendor/         pi-post-compact — installed twice by the Dockerfile: as this
+                package's file: dependency (imported by src/runner.js) and into
+                the pi agent home (loaded by pi as an extension)
 helm/           Helm chart (published as an OCI artifact)
 Dockerfile      Node 22 + gcloud/kubectl/helm/uv/semble/graphify toolbox
 ```

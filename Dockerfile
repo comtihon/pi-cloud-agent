@@ -57,10 +57,18 @@ RUN git config --global user.email "agent@container" \
     && git config --global user.name "Agent"
 
 # ── Agent server Node app ─────────────────────────────────────────────────
+# vendor/ is copied before `npm ci` because pi-post-compact is a file:
+# dependency — the install fails outright if the directory is not there yet.
+COPY vendor ./vendor
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
 # ── pi-mcp-adapter + pi-post-compact (extensions loaded by pi SDK) ─────────
+# A SECOND install of the same vendored package, into the pi agent home. This
+# copy is what pi discovers and loads as an extension for native tool calls
+# (its `context` and `tool_result` hooks); the file: dependency installed above
+# is what src/runner.js imports directly for the mcp-resolver loop. Same code,
+# two consumers.
 COPY vendor/pi-post-compact /root/.pi/agent/vendor/pi-post-compact
 RUN mkdir -p /root/.pi/agent/npm && \
     cd /root/.pi/agent/npm && \

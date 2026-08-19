@@ -1,0 +1,193 @@
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { complete, getModel } from "@earendil-works/pi-ai";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+const SYSTEM_PROMPT_ADDON = `
+## Tool Result Compaction (REQUIRED)
+
+For EVERY tool call except edit, write, and multiedit, you MUST include a \`post_compact\` field:
+- \`post_compact.exact: false\` — summarise the result (DEFAULT — use unless you have a specific reason for verbatim output)
+- \`post_compact.exact: true\` — keep verbatim output (only when you need exact line numbers, content to diff/edit, or precise error text)
+- \`post_compact.reason: string\` — REQUIRED; describe what you are looking for in this tool call
+
+Omitting \`post_compact\` is only permitted for edit, write, and multiedit tools.
+
+Examples:
+- \`semble search "auth flow"\` → \`post_compact: { exact: false, reason: "looking for authentication entry points" }\`
+- \`bash\` reading a file you will edit → \`post_compact: { exact: true, reason: "need exact content to produce an edit" }\`
+- \`jira_get_issue\` → \`post_compact: { exact: false, reason: "need ticket description and acceptance criteria" }\`
+`.trimStart();
+export function loadConfig(cwd) {
+    const globalPath = join(getAgentDir(), "post-compact.json");
+    const projectPath = join(cwd, ".pi", "post-compact.json");
+    let globalConfig = {};
+    let projectConfig = {};
+    if (existsSync(globalPath)) {
+        try {
+            const content = readFileSync(globalPath, "utf-8");
+            globalConfig = JSON.parse(content);
+        }
+        catch {
+            // ignore parse errors
+        }
+    }
+    if (existsSync(projectPath)) {
+        try {
+            const content = readFileSync(projectPath, "utf-8");
+            projectConfig = JSON.parse(content);
+        }
+        catch {
+            // ignore parse errors
+        }
+    }
+    return { ...globalConfig, ...projectConfig };
+}
+export function parseMetaLlm(metaLlm) {
+    const idx = metaLlm.indexOf("/");
+    if (idx <= 0)
+        return undefined;
+    return {
+        provider: metaLlm.slice(0, idx),
+        model: metaLlm.slice(idx + 1),
+    };
+}
+/**
+ * Summarize `text` via the configured meta-LLM, focused on `opts.reason`.
+ * Returns `undefined` on any failure or empty summary — never throws
+ * ("never break the agent"), matching the original inline tool_result hook
+ * behavior this was extracted from.
+ */
+export async function compactToolResult(text, opts, metaLlm, modelRegistry) {
+    if (opts.exact)
+        return undefined;
+    try {
+        const parsed = parseMetaLlm(metaLlm);
+        if (!parsed)
+            return undefined;
+        const model = getModel(parsed.provider, parsed.model);
+        if (!model)
+            return undefined;
+        const auth = await modelRegistry.getApiKeyAndHeaders(model);
+        if (!auth.ok)
+            return undefined;
+        const summaryPrompt = [
+            `Summarize the following tool output concisely. Focus on: ${opts.reason}`,
+            "",
+            "Preserve key facts, values, and any errors. Omit irrelevant details.",
+            "",
+            "<output>",
+            text,
+            "</output>",
+        ].join("\n");
+        const response = await complete(model, {
+            messages: [
+                {
+                    role: "user",
+                    content: [{ type: "text", text: summaryPrompt }],
+                    timestamp: Date.now(),
+                },
+            ],
+        }, {
+            apiKey: auth.apiKey,
+            headers: auth.headers,
+        });
+        const summary = response.content
+            .filter((c) => c.type === "text")
+            .map((c) => c.text)
+            .join("\n");
+        if (!summary.trim())
+            return undefined;
+        // pi-ai's Usage shape (input/output/totalTokens) differs from the
+        // OpenAI-style prompt_tokens/completion_tokens/total_tokens shape the
+        // caller (runner.js's _addUsage accumulator) expects — map it here.
+        const usage = response.usage
+            ? {
+                prompt_tokens: response.usage.input,
+                completion_tokens: response.usage.output,
+                total_tokens: response.usage.totalTokens,
+            }
+            : undefined;
+        return { text: summary, usage };
+    }
+    catch {
+        // Never break the agent
+        return undefined;
+    }
+}
+export default function postCompactExtension(pi) {
+    const directives = new Map();
+    let configCwd = "";
+    pi.registerFlag("meta_llm", {
+        description: "Meta-LLM to use for post-compact summarization (provider/model)",
+        type: "string",
+    });
+    pi.on("session_start", async (_event, ctx) => {
+        configCwd = ctx.cwd;
+    });
+    pi.on("before_agent_start", async (event) => {
+        return {
+            systemPrompt: `${event.systemPrompt}\n\n${SYSTEM_PROMPT_ADDON}`,
+        };
+    });
+    pi.on("tool_call", async (event) => {
+        const input = event.input;
+        const raw = input["post_compact"];
+        if (raw === undefined || raw === null)
+            return;
+        // Remove from input so the original tool never sees it
+        delete input["post_compact"];
+        // Validate shape
+        if (typeof raw === "object" &&
+            raw !== null &&
+            typeof raw["exact"] === "boolean" &&
+            typeof raw["reason"] === "string") {
+            const directive = raw;
+            directives.set(event.toolCallId, directive);
+        }
+    });
+    pi.on("tool_result", async (event, ctx) => {
+        const directive = directives.get(event.toolCallId);
+        directives.delete(event.toolCallId);
+        if (!directive || directive.exact !== false) {
+            return undefined;
+        }
+        // Skip if any image content present
+        const hasImage = event.content.some((part) => part.type === "image");
+        if (hasImage)
+            return undefined;
+        // Extract text-only content
+        const textParts = event.content
+            .filter((part) => part.type === "text")
+            .map((part) => part.text);
+        if (textParts.length === 0)
+            return undefined;
+        // If content is not text-only (mixed), skip
+        if (textParts.length !== event.content.length)
+            return undefined;
+        const fullText = textParts.join("\n");
+        if (!fullText.trim())
+            return undefined;
+        // Resolve meta-LLM config
+        const flagValue = pi.getFlag("meta_llm");
+        const config = loadConfig(configCwd);
+        const metaLlmStr = typeof flagValue === "string" && flagValue
+            ? flagValue
+            : config.meta_llm ?? "anthropic/claude-haiku-4-5";
+        const result = await compactToolResult(fullText, directive, metaLlmStr, ctx.modelRegistry);
+        if (!result)
+            return undefined;
+        // result.usage is intentionally discarded here: the pi-coding-agent SDK's
+        // ExtensionContext/ExtensionAPI surface (checked against the installed
+        // @earendil-works/pi-coding-agent .d.ts) exposes no mechanism for a plugin
+        // to report supplementary token usage into the SDK's own session-level
+        // accounting — getContextUsage() is read-only and there is no
+        // addUsage/reportTokens/recordUsage-style API. This is a hard SDK
+        // limitation, not an oversight; the meta-LLM tokens spent on compaction
+        // via this native tool_result hook path are invisible to session stats.
+        // (The separate mcp-resolver-loop path in runner.js works around this by
+        // accumulating usage itself since it already intercepts raw HTTP responses.)
+        return {
+            content: [{ type: "text", text: result.text }],
+        };
+    });
+}

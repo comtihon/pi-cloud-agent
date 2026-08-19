@@ -1,0 +1,7 @@
+.git
+.github
+node_modules
+helm
+test
+*.tgz
+README.md

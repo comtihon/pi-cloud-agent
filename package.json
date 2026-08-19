@@ -1,0 +1,14 @@
+{
+  "name": "pi-cloud-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "pi coding agent wrapped in an HTTP server, compatible with ai-agents-carrier",
+  "license": "MIT",
+  "type": "module",
+  "engines": { "node": ">=22.19.0" },
+  "scripts": { "start": "node src/server.js", "test": "node --test test/*.test.mjs" },
+  "dependencies": {
+    "express": "^4.21.2",
+    "@earendil-works/pi-coding-agent": "^0.79.6"
+  }
+}

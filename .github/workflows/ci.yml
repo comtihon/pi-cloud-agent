@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    name: node --test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - uses: azure/setup-helm@v4
+
+      - name: Lint Helm chart
+        run: helm lint helm/
+
+  release:
+    name: Tag, package, bump
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, '[skip ci]')
+    permissions:
+      contents: write
+      packages: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read version
+        id: version
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push tag
+        run: |
+          if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "Tag ${{ steps.version.outputs.tag }} already exists, skipping"
+            exit 0
+          fi
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      - uses: azure/setup-helm@v4
+
+      - name: Pin chart to released version
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sed -i "s/^version: .*/version: $VERSION/" helm/Chart.yaml
+          sed -i "s/^appVersion: .*/appVersion: \"$VERSION\"/" helm/Chart.yaml
+          sed -i "s|^  tag: .*|  tag: v$VERSION|" helm/values.yaml
+
+      - name: Build Helm package
+        run: |
+          helm package helm/ \
+            --version "${{ steps.version.outputs.version }}" \
+            --app-version "${{ steps.version.outputs.version }}" \
+            --destination dist/
+
+      - name: Upload Helm chart artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-chart-${{ steps.version.outputs.version }}
+          path: dist/*.tgz
+          retention-days: 90
+
+      # Published as an OCI artifact so ai-agents-carrier's K8sRuntime can pull
+      # it directly via `helm upgrade --install <rel> oci://ghcr.io/comtihon/charts/pi-cloud-agent`.
+      - name: Push Helm chart to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
+          helm push \
+            "dist/pi-cloud-agent-${{ steps.version.outputs.version }}.tgz" \
+            oci://ghcr.io/comtihon/charts
+
+      - name: Bump patch version
+        id: bump
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          PATCH=$(echo "$VERSION" | cut -d. -f3)
+          NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
+          echo "$NEW_VERSION" > VERSION
+          sed -i "s/^  \"version\": \".*\"/  \"version\": \"$NEW_VERSION\"/" package.json
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Commit bumped version
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add VERSION package.json helm/Chart.yaml helm/values.yaml
+          git commit -m "chore: bump version to ${{ steps.bump.outputs.new_version }} [skip ci]"
+          git push origin main
+
+  publish:
+    name: Build & push Docker image
+    runs-on: ubuntu-latest
+    needs: release
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/comtihon/pi-cloud-agent:latest
+            ghcr.io/comtihon/pi-cloud-agent:v${{ needs.release.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

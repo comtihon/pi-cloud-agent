@@ -1,0 +1,8 @@
+node_modules/
+*.tgz
+.env
+.DS_Store
+
+# vendor/pi-post-compact ships prebuilt (dist/ is tracked on purpose) — the
+# Dockerfile npm-installs it from source into the pi agent home.
+/dist/

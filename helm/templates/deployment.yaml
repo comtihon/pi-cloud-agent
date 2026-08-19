@@ -1,0 +1,97 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pi-cloud-agent.fullname" . }}
+  labels:
+    {{- include "pi-cloud-agent.labels" . | nindent 4 }}
+spec:
+  revisionHistoryLimit: 3
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "pi-cloud-agent.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "pi-cloud-agent.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "pi-cloud-agent.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default (printf "v%s" .Chart.AppVersion) }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            {{- range $k, $v := .Values.env }}
+              - name: "{{ $k }}"
+                value: {{ $v | quote }}
+            {{- end }}
+            {{- range $kp, $vp := .Values.config }}
+              {{- if kindIs "string" $vp }}
+              - name: "{{ $kp |upper }}"
+                value: "{{ $vp }}"
+              {{- else }}
+              {{- range $k, $v := $vp }}
+              - name: "{{ $kp |upper }}_{{ $k |upper }}"
+                value: "{{ $v }}"
+              {{- end }}
+              {{- end }}
+            {{- end }}
+            {{- range $kp, $vp := .Values.secrets }}
+              - name: "{{ $kp |upper }}"
+                valueFrom:
+                  secretKeyRef:
+                    key: "{{ $vp.key }}"
+                    name: "{{ $vp.name }}"
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          {{- if .Values.healthchecks.enabled }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            timeoutSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            timeoutSeconds: 30
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          {{- with .Values.volumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.volumes }}
+      volumes:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

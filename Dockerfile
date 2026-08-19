@@ -57,8 +57,8 @@ RUN git config --global user.email "agent@container" \
     && git config --global user.name "Agent"
 
 # ── Agent server Node app ─────────────────────────────────────────────────
-COPY package.json ./
-RUN npm install --omit=dev
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 
 # ── pi-mcp-adapter + pi-post-compact (extensions loaded by pi SDK) ─────────
 COPY vendor/pi-post-compact /root/.pi/agent/vendor/pi-post-compact

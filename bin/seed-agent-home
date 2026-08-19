@@ -1,0 +1,23 @@
+#!/bin/sh
+# Seed the pi agent home from the read-only copy baked into the image.
+#
+# The container runs as a non-root user with a read-only root filesystem, so the
+# directory pi writes to at runtime (settings.json, mcp.json, mcp-cache.json,
+# sessions/) has to be a writable mount. That mount hides anything baked at the
+# same path, so the extensions pi must load are baked at PI_BAKED_AGENT_DIR
+# instead and copied in here, once per container start.
+#
+# Doing this in the entrypoint rather than a k8s initContainer keeps a plain
+# `docker run` of this image working identically.
+set -eu
+
+: "${PI_CODING_AGENT_DIR:=/home/node/.pi/agent}"
+: "${PI_BAKED_AGENT_DIR:=/opt/pi/agent}"
+
+if [ -d "$PI_BAKED_AGENT_DIR" ]; then
+    mkdir -p "$PI_CODING_AGENT_DIR"
+    # -n so a warm container's own settings.json/mcp.json are never clobbered.
+    cp -Rn "$PI_BAKED_AGENT_DIR/." "$PI_CODING_AGENT_DIR/" 2>/dev/null || true
+fi
+
+exec "$@"

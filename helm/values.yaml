@@ -40,9 +40,22 @@ serviceAccount:
 podAnnotations: {}
 podLabels: {}
 
-podSecurityContext: {}
+# The image runs as uid/gid 1000 (`node`) and needs no write access to its root
+# filesystem — every runtime write target is one of the emptyDir mounts below.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
 
-securityContext: {}
+securityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
 
 service:
   type: ClusterIP
@@ -60,6 +73,10 @@ autoscaling:
   maxReplicas: 10
   targetCPUUtilizationPercentage: 80
 
+# /home/node, /tmp and /workspace are mounted as emptyDirs by the Deployment
+# template itself — readOnlyRootFilesystem makes them mandatory, so they are not
+# configurable here (and cannot be clobbered by `--set-json volumes=...`).
+# Anything listed below is mounted in addition to those three.
 volumes: []
 volumeMounts: []
 

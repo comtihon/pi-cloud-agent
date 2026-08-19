@@ -70,3 +70,41 @@ fi
     rmSync(binDir, { recursive: true, force: true })
   }
 })
+
+// Regression: the bucket/path in `extra` come straight off the /start request
+// payload. They used to be joined into a shell string, so a bucket containing
+// shell metacharacters executed. execFileSync passes an argv array instead, so
+// the metacharacters must reach gsutil as literal argument text.
+test('downloadWorkspace does not let a malicious bucket name reach a shell', () => {
+  const workspaceDir = mkdtempSync(join(tmpdir(), 'workspace-'))
+  const binDir = mkdtempSync(join(tmpdir(), 'fakebin-'))
+  const canary = join(mkdtempSync(join(tmpdir(), 'canary-')), 'pwned')
+  const argLog = join(binDir, 'args.log')
+
+  const originalPath = process.env.PATH
+  try {
+    // Fake gsutil records the argv it was handed, then fails so the caller
+    // stops early. If a shell ever interprets the bucket, the canary appears.
+    const fakeGsutil = join(binDir, 'gsutil')
+    writeFileSync(fakeGsutil, `#!/bin/sh\nprintf '%s\\n' "$@" >> ${argLog}\nexit 1\n`)
+    chmodSync(fakeGsutil, 0o755)
+    process.env.PATH = `${binDir}:${originalPath}`
+
+    const malicious = `bkt; touch ${canary}; #`
+    const result = downloadWorkspace({ s3_bucket: malicious, s3_path: 'p' }, workspaceDir)
+
+    assert.equal(result, false, 'the fake gsutil fails, so restore reports failure')
+    assert.equal(existsSync(canary), false, 'injected command must never run')
+
+    // The metacharacters must have arrived as one literal argument.
+    const args = readFileSync(argLog, 'utf-8').split('\n').filter(Boolean)
+    assert.ok(
+      args.some((a) => a === `gs://${malicious}/p/workspace.tar.gz`),
+      `bucket must reach gsutil verbatim as a single argv entry, got: ${JSON.stringify(args)}`,
+    )
+  } finally {
+    process.env.PATH = originalPath
+    rmSync(workspaceDir, { recursive: true, force: true })
+    rmSync(binDir, { recursive: true, force: true })
+  }
+})

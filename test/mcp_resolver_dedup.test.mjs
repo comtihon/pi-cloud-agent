@@ -13,27 +13,31 @@ import {
 test('buildMcpUsageExample: empty toolLines → generic fallback, no concrete tool', () => {
   const s = buildMcpUsageExample([])
   assert.equal(s, 'mcp({tool:"...", args:"{...}", reason:"why you need this tool call"})')
-  assert.ok(!s.includes('jira'))
+  assert.ok(!s.includes('args:{'))
 })
 
-test('buildMcpUsageExample: first entry wins, uses search example, never mentions jira', () => {
-  const s = buildMcpUsageExample(['semble: search', 'semble: find_related'])
-  assert.ok(s.includes('search'))
-  assert.ok(s.includes('authentication flow'))
-  assert.ok(!s.includes('jira'))
-  assert.ok(!s.includes('find_related'))
+test('buildMcpUsageExample: the first entry wins and no other tool leaks in', () => {
+  const s = buildMcpUsageExample(['alpha: alpha_search', 'beta: beta_lookup'])
+  assert.ok(s.includes('alpha_search'))
+  assert.ok(!s.includes('beta_lookup'))
 })
 
-test('buildMcpUsageExample: jira tool uses jira example correctly', () => {
-  const s = buildMcpUsageExample(['jira: jira_get_issue'])
-  assert.ok(s.includes('jira_get_issue'))
-  assert.ok(s.includes('issue_key'))
-  assert.ok(s.includes('PROJ-1234'))
+test('buildMcpUsageExample: args are a placeholder, never a baked-in example', () => {
+  // The agent does not know what any tool's arguments look like, so the example
+  // must stay generic no matter which tool a run happens to be granted.
+  for (const line of ['tracker: tracker_get_item', 'grapher: grapher_query', 'x: search']) {
+    const s = buildMcpUsageExample([line])
+    assert.equal(s, `mcp({tool:"${line.split(': ')[1]}", args:"{...}", reason:"why you need this tool call"})`)
+  }
+})
+
+test('buildMcpUsageExample: a bare entry with no "server: " prefix still works', () => {
+  assert.ok(buildMcpUsageExample(['plain_tool']).includes('tool:"plain_tool"'))
 })
 
 test('buildMcpUsageExample: unknown tool → generic-but-real-tool-name fallback', () => {
   const s = buildMcpUsageExample(['unknownserver: some_custom_tool'])
   assert.ok(s.includes('some_custom_tool'))
   assert.ok(s.includes('{...}'))
-  assert.ok(!s.includes('jira'))
+  assert.ok(!s.includes('args:{'))
 })

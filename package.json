@@ -1,6 +1,6 @@
 {
   "name": "pi-cloud-agent",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "private": true,
   "description": "pi coding agent wrapped in an HTTP server, compatible with ai-agents-carrier",
   "license": "MIT",

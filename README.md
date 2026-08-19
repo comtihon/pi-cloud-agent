@@ -121,17 +121,101 @@ falls back to the raw text rather than losing data.
 | `ANTHROPIC_API_KEY`              | Anthropic provider credentials. |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL` | OpenAI-compatible provider (OpenRouter etc.). |
 | `META_LLM_PROVIDER`, `META_LLM_MODEL` | Model used for compaction summaries. |
-| `GITHUB_TOKEN`                   | GitHub MCP / git operations. |
-| `JIRA_URL`, `JIRA_USERNAME`, `JIRA_API_TOKEN` | Jira MCP (stdio, via `uvx`). |
+| `GIT_TOKEN`, `GIT_TOKEN_<HOST>`  | Token for HTTPS git operations, read by the credential helper (see below). |
 | `GOOGLE_APPLICATION_CREDENTIALS` | GCS workspace persistence + `gcloud`/`kubectl`/`helm` access. |
-| `PI_CODING_AGENT_DIR`            | pi agent home. Default `/root/.pi/agent`. |
+| `PI_CODING_AGENT_DIR`            | pi agent home, a writable mount. Default `$HOME/.pi/agent`; the image bakes its extensions at `PI_BAKED_AGENT_DIR` (`/opt/pi/agent`) and the entrypoint seeds this directory from it. |
 
-The image ships `git`, `ripgrep`, `jq`, `gcloud`, `kubectl`, `helm`, `uv`/`uvx`,
-`semble` (semantic code search) and `graphify` (codebase knowledge
-graph), so the agent has a usable toolbox out of the box.
+Tool credentials are **not** configured on the image — they arrive per run with
+the tool that needs them (see [Per-run tool grants](#per-run-tool-grants)).
+
+The image ships a general toolbox — `git`, `ripgrep`, `jq`, `gcloud`, `kubectl`,
+`helm`, `uv`/`uvx` and a couple of code-search CLIs — but shipping a binary is
+not the same as granting it: only the tools a run is granted are usable.
 
 Workspaces can be checkpointed to GCS between steps of a workflow (`src/workspaceS3.js`), which is
 how a multi-step run resumes on a fresh pod.
+
+---
+
+## Per-run tool grants
+
+The agent hardcodes no tool name, env var or alias. The caller decides what a
+run may use and sends it in `agent_config`, with credentials already resolved:
+
+```json
+{
+  "tools": [
+    {
+      "name": "tracker",
+      "command": "tracker-cli",
+      "env": { "TRACKER_URL": "https://tracker.example", "TRACKER_TOKEN": "…" },
+      "bash_match": "tracker-cli",
+      "cli_tools": {
+        "tracker_get_item": {
+          "args": ["show", "{item_id}"],
+          "required": ["item_id"],
+          "optional": { "format": ["--format", "{format}"] },
+          "timeout_seconds": 60
+        }
+      },
+      "workspace_hook": {
+        "args": ["index", "."],
+        "requires_files": ["tracker-cache/state.json"],
+        "timeout_seconds": 120
+      }
+    }
+  ],
+  "blocked_commands": ["some-binary-this-run-may-not-use"]
+}
+```
+
+A grant is an *allowance*; usability also depends on the image. The agent
+registers the intersection of granted tools and binaries actually present on
+`PATH`, and logs the rest as skipped, so a grant referring to a tool this image
+does not ship degrades instead of failing the run.
+
+* **`command`** — the binary to look for. Omit it for an env-only tool (one that
+  just needs credentials exported); those are always usable.
+* **`env`** — exported to `process.env` so bash and subprocesses inherit it.
+  The keys installed by the previous run are removed first, so on a warm pod a
+  revoked tool cannot reuse the credentials of the run before it.
+* **`bash_match`** — regex marking which bash commands exercise this tool, used
+  for progress reporting.
+* **`cli_tools`** — CLI invocations exposed through the `mcp()` gateway, for a
+  tool with no MCP server of its own. `{name}` placeholders are filled from the
+  call arguments (`{name|fallback}` supplies a default), `cwd` sets the working
+  directory, and `requires_files` refuses the call unless those files exist.
+* **`workspace_hook`** — a command run once per restored workspace repo before
+  the agent starts, for a tool keeping a per-repo cache or index. It runs only
+  in repos already containing every `requires_files` entry, so it refreshes an
+  existing cache and never bootstraps one. It is timeout-bounded, and a failure
+  is logged without failing the run.
+* **`blocked_commands`** — binaries the image ships but this run may not use.
+  Each is shadowed by an exit-127 stub on a `PATH` prefix.
+
+Argv always comes from these descriptors as an array and is passed straight to
+`execFile`/`spawn` — nothing is interpolated into a shell.
+
+### MCP servers
+
+`mcp_servers` entries are either remote (`url`) or stdio (`command`). A stdio
+server is normally pre-started as a local HTTP server so `pi-mcp-adapter`
+connects instantly instead of racing a 15-30s subprocess boot. A server whose
+CLI cannot be re-hosted over HTTP (no `--transport`/`--port`) should be sent
+with **`"prestart_http": false`**; it is then wired as a plain stdio entry
+instead. Absent, the flag defaults to `true`.
+
+### Git credentials
+
+`bin/git-credential-env` is installed as a git credential helper and answers
+from the environment, per host: for `example.com` it reads
+`GIT_TOKEN_EXAMPLE_COM` / `GIT_USERNAME_EXAMPLE_COM`, then falls back to
+`GIT_TOKEN` / `GIT_USERNAME` (username defaults to `x-access-token`).
+
+So a tool that grants code-host access just declares the matching variable in
+its `env`. Nothing is written to disk, no token ever reaches a command line, no
+forge is hardcoded, and when the tool is not granted the variable is absent and
+the helper stays silent — which is what revokes the access.
 
 ---
 
@@ -183,13 +267,15 @@ config and existing k8s Secrets).
 ## Layout
 
 ```
-src/            HTTP server, pi SDK runner, backend client, GCS workspace helpers
+src/            HTTP server, pi SDK runner, tool plumbing, backend client,
+                GCS workspace helpers
+bin/            git credential helper (reads tokens from the environment)
 test/           node:test suites
 vendor/         pi-post-compact — installed twice by the Dockerfile: as this
                 package's file: dependency (imported by src/runner.js) and into
                 the pi agent home (loaded by pi as an extension)
 helm/           Helm chart (published as an OCI artifact)
-Dockerfile      Node 22 + gcloud/kubectl/helm/uv/semble/graphify toolbox
+Dockerfile      Node 22 + gcloud/kubectl/helm/uv toolbox image
 ```
 
 ## License

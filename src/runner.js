@@ -17,10 +17,23 @@
 
 import { writeFileSync, mkdirSync, existsSync, readFileSync, readdirSync } from 'fs'
 import { join } from 'path'
-import { spawn, exec, execSync } from 'child_process'
+import { spawn, exec } from 'child_process'
 import { promisify } from 'util'
 import { createAgentSession, AuthStorage, ModelRegistry, createReadTool, createEditTool, createWriteTool, createGrepTool, createFindTool, createLsTool } from '@earendil-works/pi-coding-agent'
 import { downloadWorkspace, uploadWorkspace, activateGcloudServiceAccount } from './workspaceS3.js'
+import {
+  applyToolEnv,
+  blockCommands,
+  buildCliInvocation,
+  cliToolLines,
+  findCliTool,
+  matchToolsFromCommand,
+  planWorkspaceHooks,
+  registerTools,
+  selectPrestartServers,
+} from './tools.js'
+
+export { matchToolsFromCommand }
 
 // Compaction/collapse policy lives in pi-post-compact, shared with the native
 // pi extension path. Only the wire-shape adapters below stay here: this file
@@ -49,10 +62,15 @@ export { summarizeToolCallArgs }
 let _mcpHttpServers = {}   // name → {proc, port, url}
 const _origFetch = globalThis.fetch  // saved before interception
 
-// PATH as seen at module load — the "clean" PATH restored whenever graphify is
-// enabled. Disabling graphify shadows the binary via a /tmp/disabled-bins stub.
+// PATH as seen at module load — the "clean" PATH every run starts from, before
+// the commands this agent was not granted are shadowed on top of it.
 const ORIGINAL_PATH = process.env.PATH || ''
-const DISABLED_BIN_DIR = '/tmp/disabled-bins'
+
+// Tools the carrier granted AND this image can actually run, plus the env keys
+// the previous run installed (removed before this run's, so a warm pod never
+// leaks a revoked tool's credentials).
+let _registeredTools = []
+let _appliedToolEnvKeys = []
 
 // Pure message-building helpers for tool_execution_start/end events.
 // Extracted from the session.subscribe() listener in startRun() so they
@@ -140,24 +158,12 @@ export function wantsExactResult(event) {
   return false
 }
 
-// Known MCP tools → realistic example args + reason, used to build a usage
-// example for the mcp tool description that reflects the tools actually
-// configured for a given run (never hardcoded to a tool that isn't present).
-const MCP_TOOL_EXAMPLES = {
-  jira_get_issue: { args: { issue_key: 'PROJ-1234' }, reason: 'need ticket description and acceptance criteria' },
-  search: { args: { query: 'authentication flow', repo: '/workspace/REPO' }, reason: 'find where auth is implemented before making changes' },
-  find_related: { args: { file_path: 'src/auth.py', line: 42, repo: '/workspace/REPO' }, reason: 'find similar code elsewhere in the repo' },
-  graphify_query: { args: { question: 'how does the mcp tool loop work', repo: '/workspace/REPO' }, reason: 'get a scoped subgraph answering a codebase question' },
-  graphify_explain: { args: { concept: 'tool gating', repo: '/workspace/REPO' }, reason: 'get a focused explanation of one concept' },
-  graphify_path: { args: { from: 'ComponentA', to: 'ComponentB', repo: '/workspace/REPO' }, reason: 'find the relationship/path between two named things' },
-}
-
 // Build the `mcp({...})` usage example shown in the mcp tool description from
 // the real per-run tool list. Picks the FIRST configured tool (toolLines entry
-// format: "${server}: ${toolName}") and, when known, uses its realistic example;
-// otherwise falls back to a generic example that still uses the real tool name.
-// Returns just the mcp(...) call string (the "Usage: " prefix is composed at the
-// call site). Empty toolLines → a fully generic example with no concrete tool.
+// format: "${server}: ${toolName}") and shows it with placeholder args — no
+// per-tool example is baked in here, since the agent does not know which tools
+// a run was granted. Returns just the mcp(...) call string (the "Usage: "
+// prefix is composed at the call site). Empty toolLines → no concrete tool.
 export function buildMcpUsageExample(toolLines) {
   const first = Array.isArray(toolLines) ? toolLines[0] : undefined
   if (!first) {
@@ -165,48 +171,7 @@ export function buildMcpUsageExample(toolLines) {
   }
   const sep = first.indexOf(': ')
   const toolName = sep >= 0 ? first.slice(sep + 2) : first
-  const known = MCP_TOOL_EXAMPLES[toolName]
-  const args = known ? JSON.stringify(known.args) : '{...}'
-  const reason = known ? known.reason : 'why you need this tool call'
-  return `mcp({tool:"${toolName}", args:${JSON.stringify(args)}, reason:${JSON.stringify(reason)}})`
-}
-
-// Map a bash command string to the addon "tool" names it exercises, used to
-// drive the tools-addon gating in the UI (mirrors the MCP server gating).
-// Heuristic is intentionally shared verbatim across all agent runtimes.
-export function matchToolsFromCommand(command) {
-  const cmd = typeof command === 'string' ? command : ''
-  const tools = []
-  if (/\bgit\b|\bgh\b/.test(cmd)) tools.push('github')
-  if (/jira|JIRA_URL|atlassian/i.test(cmd)) tools.push('jira')
-  if (/\bgraphify\b/.test(cmd)) tools.push('graphify')
-  return tools
-}
-
-// Graphify, like semble, has no per-call-repo-switchable HTTP MCP mode usable
-// here, so it is exposed as a CLI shim routed through the mcp() gateway. These
-// two pure helpers decide whether a call targets graphify and build its argv.
-export function isGraphifyToolCall(server, toolName) {
-  if (server === 'graphify') return true
-  return toolName === 'graphify_query' || toolName === 'graphify_explain' || toolName === 'graphify_path'
-}
-
-export function buildGraphifyCliArgs(toolName, toolArgs) {
-  const repo = toolArgs && toolArgs.repo
-  if (!repo) return { error: 'Error: graphify calls require a "repo" arg, e.g. repo: "/workspace/<repo-name>"' }
-  if (toolName === 'graphify_query') {
-    if (!toolArgs.question) return { error: 'Error: graphify_query requires a "question" arg' }
-    return { repo, cliArgs: ['query', String(toolArgs.question), '.'] }
-  }
-  if (toolName === 'graphify_explain') {
-    if (!toolArgs.concept) return { error: 'Error: graphify_explain requires a "concept" arg' }
-    return { repo, cliArgs: ['explain', String(toolArgs.concept)] }
-  }
-  if (toolName === 'graphify_path') {
-    if (!toolArgs.from || !toolArgs.to) return { error: 'Error: graphify_path requires "from" and "to" args' }
-    return { repo, cliArgs: ['path', String(toolArgs.from), String(toolArgs.to)] }
-  }
-  return { error: `Error: unknown graphify tool "${toolName}"` }
+  return `mcp({tool:"${toolName}", args:"{...}", reason:"why you need this tool call"})`
 }
 
 export function formatToolStartMessage(event) {
@@ -357,23 +322,29 @@ export async function startRun(body, client, setAbort) {
     env_vars = {},
     system_prompt,
     mcp_servers = [],
-    tool_access = null,
+    tools = [],
+    blocked_commands = [],
   } = agent_config
 
-  // ── Bash-level tool gates (github/jira/graphify) ───────────────────────
-  // Absent/null tool_access → all enabled (rollout compat). Present → exact
-  // (missing key = disabled). A `toolEnabled` helper centralizes the rule.
-  const toolEnabled = (name) => (tool_access == null ? true : Boolean(tool_access[name]))
-  // Warm-pod hygiene: purge stale gated env vars from a prior run BEFORE we
-  // assign fresh credentials, so a now-disabled tool cannot leak old values.
-  const _GATED_ENV = {
-    github: ['GITHUB_TOKEN', 'MCP_GITHUB_API_KEY'],
-    jira: ['JIRA_API_TOKEN', 'MCP_JIRA_API_TOKEN', 'JIRA_URL', 'JIRA_USERNAME'],
+  // ── Tools ──────────────────────────────────────────────────────────────
+  // The carrier decides which tools this agent may use and ships each one's
+  // credentials with it; this image only decides which of them it can run.
+  // Nothing about any specific tool is known here.
+  const { registered, skipped } = registerTools(tools)
+  _registeredTools = registered
+  if (registered.length > 0) {
+    console.log('[runner] tools registered:', registered.map(t => t.name).join(', '))
   }
-  for (const [name, keys] of Object.entries(_GATED_ENV)) {
-    if (!toolEnabled(name)) {
-      for (const k of keys) delete process.env[k]
-    }
+  for (const tool of skipped) {
+    console.warn(`[runner] tool '${tool.name}' granted but '${tool.command}' is not installed here — skipped`)
+  }
+  // Warm-pod hygiene: the previous run's tool env goes before this run's lands,
+  // so a revoked tool cannot leak old credentials into the next run.
+  _appliedToolEnvKeys = applyToolEnv(registered, _appliedToolEnvKeys)
+  // Commands belonging to tools this agent was not granted are shadowed.
+  process.env.PATH = blockCommands(blocked_commands, { originalPath: ORIGINAL_PATH })
+  if (Array.isArray(blocked_commands) && blocked_commands.length > 0) {
+    console.log('[runner] commands blocked for this agent:', blocked_commands.join(', '))
   }
 
   // ── Resolve model + auth from agent_config ─────────────────────────────
@@ -383,68 +354,6 @@ export async function startRun(body, client, setAbort) {
   // (bash, git, etc.) inherit them.
   Object.assign(process.env, credentials, env_vars)
 
-  if (toolEnabled('github')) {
-    // Alias MCP_GITHUB_API_KEY → GITHUB_TOKEN (tools/bash git-clone expect
-    // GITHUB_TOKEN by convention). Keep MCP_GITHUB_API_KEY as-is.
-    if (credentials.MCP_GITHUB_API_KEY && !process.env.GITHUB_TOKEN) {
-      process.env.GITHUB_TOKEN = credentials.MCP_GITHUB_API_KEY
-    }
-    // Wire git to auth https://github.com clones via GITHUB_TOKEN. Helper reads
-    // the token from the env at fetch time — nothing secret is written to disk,
-    // warm-pod token rotation is handled, and the command is safe to log.
-    if (process.env.GITHUB_TOKEN) {
-      try {
-        execSync(
-          `git config --global --replace-all credential.helper '!f() { echo username=x-access-token; echo "password=$GITHUB_TOKEN"; }; f'`,
-          { stdio: 'ignore' }
-        )
-      } catch (e) {
-        console.warn(`[runner] git credential helper setup failed: ${e.message}`)
-      }
-    }
-  } else {
-    // Disabled: drop any git credential helper so warm-pod reuse can't clone.
-    try {
-      execSync('git config --global --unset-all credential.helper', { stdio: 'ignore' })
-    } catch (e) { /* ignore — helper may not be set */ }
-  }
-
-  if (toolEnabled('jira')) {
-    // Alias MCP_JIRA_API_TOKEN → JIRA_API_TOKEN (bash fallbacks in agent
-    // prompts expect the bare name by convention, matching the GitHub alias
-    // above). The backend forwards JIRA_URL/JIRA_USERNAME via `credentials`
-    // when the jira tool is enabled (already on process.env from the
-    // Object.assign above); the jira `mcp_servers` env below is kept as a
-    // fallback for backends that predate that forwarding.
-    if (credentials.MCP_JIRA_API_TOKEN && !process.env.JIRA_API_TOKEN) {
-      process.env.JIRA_API_TOKEN = credentials.MCP_JIRA_API_TOKEN
-    }
-    const jiraServer = (Array.isArray(mcp_servers) ? mcp_servers : []).find(s => s?.name === 'jira')
-    if (jiraServer?.env) {
-      if (jiraServer.env.JIRA_URL && !process.env.JIRA_URL) {
-        process.env.JIRA_URL = jiraServer.env.JIRA_URL
-      }
-      if (jiraServer.env.JIRA_USERNAME && !process.env.JIRA_USERNAME) {
-        process.env.JIRA_USERNAME = jiraServer.env.JIRA_USERNAME
-      }
-    }
-  }
-
-  // graphify: shadow the binary on PATH with an exit-127 stub when disabled;
-  // restore the clean PATH when enabled (reversible per warm-pod run).
-  if (toolEnabled('graphify')) {
-    process.env.PATH = ORIGINAL_PATH
-  } else {
-    try {
-      mkdirSync(DISABLED_BIN_DIR, { recursive: true })
-      const stubPath = join(DISABLED_BIN_DIR, 'graphify')
-      writeFileSync(stubPath, '#!/bin/sh\necho "graphify is disabled for this agent" >&2\nexit 127\n', { mode: 0o755 })
-      process.env.PATH = `${DISABLED_BIN_DIR}:${ORIGINAL_PATH}`
-      console.log(`[runner] graphify disabled — shadowed on PATH via ${stubPath}`)
-    } catch (e) {
-      console.warn(`[runner] failed to install graphify stub: ${e.message}`)
-    }
-  }
   const keyEnvName = extra.llm_api_key_env || 'ANTHROPIC_API_KEY'
   const apiKey = credentials[keyEnvName]
   if (apiKey) {
@@ -461,19 +370,15 @@ export async function startRun(body, client, setAbort) {
   activateGcloudServiceAccount()
 
   // ── Pre-start stdio MCP servers as HTTP so pi-mcp-adapter connects instantly ──
-  // Spawning uvx mcp-atlassian during session_start races with the first model
-  // call. Pre-start it here as a local HTTP server so initializeMcp finds it
-  // already running — connection is instant vs 15-30s subprocess startup.
+  // Spawning a stdio MCP server during session_start races with the first model
+  // call. Pre-starting it here as a local HTTP server means initializeMcp finds
+  // it already running — instant vs a 15-30s subprocess startup.
   _mcpHttpServers = {}  // reset module-level map for this run
   let _nextPort = 8090
-  const _mcpServersForSession = Array.isArray(mcp_servers) ? [...mcp_servers] : []
-  for (const s of _mcpServersForSession) {
-    if (!s || !s.name || s.url) continue  // skip remote/HTTP servers
-    if (!Array.isArray(s.command) || !s.command.length) continue
-    // semble's MCP server is stdio-only (run_stdio_async) and its CLI rejects
-    // --transport/--port — leave it out of the HTTP pre-start so setupMcp
-    // writes it as a stdio entry for pi-mcp-adapter instead.
-    if (s.command[0] === 'semble') continue
+  // Remote servers, command-less entries, and the ones the carrier marked
+  // `prestart_http: false` (their CLI has no --transport/--port) are left out;
+  // setupMcp then writes those as stdio entries for pi-mcp-adapter instead.
+  for (const s of selectPrestartServers(mcp_servers)) {
     const port = _nextPort++
     const env = { ...process.env, ...(s.env || {}) }
     console.log(`[pi-agent] pre-starting ${s.name} as HTTP on port ${port}`)
@@ -513,7 +418,8 @@ export async function startRun(body, client, setAbort) {
     }))
   ))
 
-  // mcp tool schema built from pre-warmed cache, injected into API calls so the model can call Jira tools
+  // mcp tool schema built from pre-warmed cache, injected into API calls so
+  // the model can call whichever MCP tools this run was given
   let _mcpToolSchema = null
   // read_artifact tool schema — always available (artifact-writing is now
   // unconditional), no dynamic content, so build it once here rather than
@@ -576,7 +482,7 @@ export async function startRun(body, client, setAbort) {
               if (props && !props.exact) props.exact = { type: 'boolean', description: 'true = keep verbatim, only when exact line numbers/content/error text needed (e.g. reading a file you will edit next); default false = summarize' }
             }
           }
-          // Strip tools this loop can't execute (read/write/edit/grep/find/ls/graphify/...)
+          // Strip tools this loop can't execute (read/write/edit/grep/find/ls/…)
           // from the outgoing request. This mcp-resolver machinery (schema injection,
           // forced tool_choice, _runMcpToolLoop) is NOT gated by model — it activates
           // unconditionally whenever _mcpToolSchema exists (i.e. whenever mcp_servers
@@ -860,7 +766,7 @@ export async function startRun(body, client, setAbort) {
               delete bashArgs.exact
               console.log('[pi-agent] executing bash (mcp-resolver loop):', command.slice(0, 200))
               Promise.resolve(client.sendProgress(`🔧 bash → ${command}`)).catch(() => {})
-              const _bashTools = matchToolsFromCommand(command)
+              const _bashTools = matchToolsFromCommand(command, _registeredTools)
               for (const t of _bashTools) {
                 Promise.resolve(client.sendProgress(`__tool_start__:${JSON.stringify({ tool: t })}`)).catch(() => {})
               }
@@ -1098,7 +1004,7 @@ export async function startRun(body, client, setAbort) {
 
   try {
     // ── Configure MCP before session (settings.json always, mcp.json when servers present) ──
-    const agentDir = process.env.PI_CODING_AGENT_DIR || '/root/.pi/agent'
+    const agentDir = process.env.PI_CODING_AGENT_DIR || join(process.env.HOME || '/home/node', '.pi/agent')
     // Pre-warm MCP tool cache so pi-mcp-adapter proxy mode has tool descriptions
     // available immediately (without requiring a restart cycle on first run).
     await prewarmMcpCache(agentDir, Array.isArray(mcp_servers) ? mcp_servers : [])
@@ -1106,17 +1012,16 @@ export async function startRun(body, client, setAbort) {
     // Build mcp tool schema from pre-warmed cache for injection into API calls
     try {
       const cachePath = join(agentDir, 'mcp-cache.json')
-      // Run when there is a warmed mcp cache OR when graphify is enabled — the
-      // latter must not depend on the backend sending any mcp_servers config.
-      if (existsSync(cachePath) || toolEnabled('graphify')) {
+      // Run when there is a warmed mcp cache OR when a registered tool exposes
+      // CLI-backed calls — those must not depend on any mcp_servers config.
+      const _cliLines = cliToolLines(_registeredTools)
+      if (existsSync(cachePath) || _cliLines.length > 0) {
         const cache = existsSync(cachePath)
           ? JSON.parse(readFileSync(cachePath, 'utf-8'))
           : { servers: {} }
         const toolLines = Object.entries(cache.servers || {})
           .flatMap(([server, data]) => (data.tools || []).map(t => `${server}: ${t.name}`))
-        if (toolEnabled('graphify')) {
-          toolLines.push('graphify: graphify_query', 'graphify: graphify_explain', 'graphify: graphify_path')
-        }
+        toolLines.push(..._cliLines)
         const desc = toolLines.length > 0
           ? `MCP gateway to call external tools. Available tools:\n${toolLines.slice(0, 60).join('\n')}\n\nUsage: ${buildMcpUsageExample(toolLines)}`
           : 'MCP gateway for calling external tools via mcp({tool, args, reason})'
@@ -1178,7 +1083,7 @@ export async function startRun(body, client, setAbort) {
       uiContext: makeUIContext(client),
     })
 
-    // Activate MCP tools — poll until mcp-atlassian and other MCP servers have
+    // Activate MCP tools — poll until the run's MCP servers have
     // registered their tools (connection + tool listing is async after bindExtensions).
     // Uses _refreshToolRegistry() to re-scan the registry, then activates everything.
     const _activateAllTools = () => {
@@ -1204,7 +1109,7 @@ export async function startRun(body, client, setAbort) {
     // Initial activation immediately after bindExtensions
     const initialCount = _activateAllTools()
 
-    // Poll for up to 15s for async MCP servers (mcp-atlassian, github) to finish connecting
+    // Poll for up to 15s for async MCP servers to finish connecting
     // and registering their tools, then re-activate to include them.
     let pollCount = 0
     const _pollInterval = setInterval(() => {
@@ -1248,7 +1153,7 @@ export async function startRun(body, client, setAbort) {
               console.error('[pi-agent] sendProgress(mcp_start):', err))
           } else if (tool === 'bash') {
             const cmd = (event.args && event.args.command) || ''
-            for (const t of matchToolsFromCommand(cmd)) {
+            for (const t of matchToolsFromCommand(cmd, _registeredTools)) {
               Promise.resolve(client.sendProgress(`__tool_start__:${JSON.stringify({ tool: t })}`)).catch((err) =>
                 console.error('[pi-agent] sendProgress(tool_start):', err))
             }
@@ -1260,7 +1165,7 @@ export async function startRun(body, client, setAbort) {
           Promise.resolve(client.sendProgress(human)).catch((err) =>
             console.error('[pi-agent] sendProgress(tool_end):', err))
           const _endCmd = (event.args && event.args.command) || ''
-          for (const t of matchToolsFromCommand(_endCmd)) {
+          for (const t of matchToolsFromCommand(_endCmd, _registeredTools)) {
             Promise.resolve(client.sendProgress(`__tool_end__:${JSON.stringify({ tool: t })}`)).catch((err) =>
               console.error('[pi-agent] sendProgress(tool_end):', err))
           }
@@ -1275,7 +1180,7 @@ export async function startRun(body, client, setAbort) {
     const extra = agent_config.extra || {}
     const WORKSPACE_DIR = '/workspace'
     downloadWorkspace(extra, WORKSPACE_DIR)
-    if (toolEnabled('graphify')) await _freshenGraphifyGraphs(WORKSPACE_DIR)
+    await runToolWorkspaceHooks(_registeredTools, WORKSPACE_DIR)
 
     client.sendProgress('Initialising pi coding agent…')
     await session.prompt(prompt)
@@ -1409,9 +1314,9 @@ async function setupMcp(agentDir, mcpServers, mcpHttpServers = {}) {
     JSON.stringify({ packages: ['pi-mcp-adapter', 'pi-post-compact'] }, null, 2),
   )
 
-  // semble is no longer hardcoded here — the backend sends it as a regular
-  // stdio entry in mcpServers when the agent's MCP addon enables it, and the
-  // generic loop below handles it like any other server.
+  // No server is special-cased here: the backend sends every MCP server the
+  // agent's MCP addon enables, and the generic loop below writes each one out
+  // as an HTTP or stdio entry.
   const servers = {}
   for (const s of mcpServers) {
     if (!s || !s.name) continue
@@ -1448,13 +1353,8 @@ async function setupMcp(agentDir, mcpServers, mcpHttpServers = {}) {
         command: cfg.command,
         args: cfg.args,
         url: cfg.url,
-        env_keys: Object.keys(cfg.env || {}).filter(k =>
-          k.startsWith('JIRA') || k.startsWith('GITHUB') || k.startsWith('CONFLUENCE') ||
-          k === 'PATH' || k === 'HOME' || k === 'USER'
-        ),
-        jira_url_present: 'JIRA_URL' in (cfg.env || {}),
-        jira_username_present: 'JIRA_USERNAME' in (cfg.env || {}),
-        jira_token_present: 'JIRA_API_TOKEN' in (cfg.env || {}),
+        // Key names only — never values, and no per-service special casing.
+        env_keys: Object.keys(cfg.env || {}),
       }
     ])
   )
@@ -1678,91 +1578,77 @@ async function _ensureMcpSession(serverUrl) {
 }
 
 /**
- * Run the stdio-only semble CLI directly for the MCP-style "search" /
- * "find_related" tool calls, translating the parsed tool args into the
- * equivalent CLI invocation and returning stdout as the tool-result string.
- *   search        → semble search "<query>" <repo> [--top-k N]
- *   find_related  → semble find-related <file_path> <line> <repo>
+ * Run one CLI-backed tool call. Argv, working directory and prerequisite files
+ * all come from the tool's own `cli_tools` template, so a CLI-only tool (one
+ * with no HTTP MCP mode of its own) is reachable through the mcp() gateway
+ * without this file knowing the command or its grammar.
  */
-function _runSembleCli(toolName, toolArgs) {
-  const repo = toolArgs.repo || toolArgs.path || '.'
-  let args
-  if (toolName === 'search') {
-    if (!toolArgs.query) return Promise.resolve('Error: semble search requires a "query" arg')
-    args = ['search', String(toolArgs.query), String(repo)]
-    if (toolArgs.top_k != null) args.push('--top-k', String(toolArgs.top_k))
-  } else {
-    // find_related / find-related
-    if (!toolArgs.file_path || toolArgs.line == null) {
-      return Promise.resolve('Error: semble find-related requires "file_path" and "line" args')
-    }
-    args = ['find-related', String(toolArgs.file_path), String(toolArgs.line), String(repo)]
-  }
+function _runCliTool(tool, toolName, spec, toolArgs) {
+  const built = buildCliInvocation(spec, toolArgs)
+  if (built.error) return Promise.resolve(`${built.error} (tool: ${toolName})`)
+  const { argv, cwd } = built
+  const command = tool.command || tool.name
+  const timeoutMs = (spec.timeout_seconds || 60) * 1000
 
   return new Promise((resolve) => {
     let out = '', err = '', done = false
     const finish = (v) => { if (!done) { done = true; clearTimeout(timer); resolve(v) } }
-    const proc = spawn('semble', args, { stdio: ['ignore', 'pipe', 'pipe'] })
-    const timer = setTimeout(() => { try { proc.kill() } catch { /* already exited */ }; finish(`Error: semble ${args[0]} timed out after 60s`) }, 60000)
+    const proc = spawn(command, argv, { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+    const timer = setTimeout(() => {
+      try { proc.kill() } catch { /* already exited */ }
+      finish(`Error: ${command} ${argv[0] ?? ''} timed out after ${timeoutMs / 1000}s`)
+    }, timeoutMs)
     proc.stdout?.on('data', d => { out += d.toString() })
     proc.stderr?.on('data', d => { err += d.toString() })
-    proc.on('error', e => finish(`Error running semble: ${e.message}`))
+    proc.on('error', e => finish(`Error running ${command}: ${e.message}`))
     proc.on('exit', code => {
       if (code === 0) finish(out.trim() || '(no output)')
-      else finish(`Error: semble ${args[0]} exited (code ${code})\n${(err || out).trim().slice(0, 2000)}`)
+      else finish(`Error: ${command} ${argv[0] ?? ''} exited (code ${code})\n${(err || out).trim().slice(0, 2000)}`)
     })
   })
 }
 
-// Shell out to the graphify CLI, mirroring _runSembleCli's contract (string
-// return, 60s timeout). Requires an existing graphify-out/graph.json in the
-// target repo; we never bootstrap a new graph (that needs an LLM backend).
-async function _runGraphifyCli(toolName, toolArgs) {
-  const built = buildGraphifyCliArgs(toolName, toolArgs)
-  if (built.error) return built.error
-  const { repo, cliArgs } = built
-  const graphPath = join(repo, 'graphify-out', 'graph.json')
-  if (!existsSync(graphPath)) {
-    return `Error: no graphify graph at ${graphPath} — graphify unavailable for this repo`
-  }
-  return new Promise((resolve) => {
-    let out = '', err = '', done = false
-    const finish = (v) => { if (!done) { done = true; clearTimeout(timer); resolve(v) } }
-    const proc = spawn('graphify', cliArgs, { cwd: repo, stdio: ['ignore', 'pipe', 'pipe'] })
-    const timer = setTimeout(() => { try { proc.kill() } catch { /* already exited */ }; finish(`Error: graphify ${cliArgs[0]} timed out after 60s`) }, 60000)
-    proc.stdout?.on('data', d => { out += d.toString() })
-    proc.stderr?.on('data', d => { err += d.toString() })
-    proc.on('error', e => finish(`Error running graphify: ${e.message}`))
-    proc.on('exit', code => {
-      if (code === 0) finish(out.trim() || '(no output)')
-      else finish(`Error: graphify ${cliArgs[0]} exited (code ${code})\n${(err || out).trim().slice(0, 2000)}`)
-    })
-  })
-}
-
-// After the workspace is restored, refresh any pre-existing per-repo graphify
-// graph (AST-only `graphify update`, no LLM). Best-effort: never throws, never
-// blocks the run — missing graphs are skipped, failures are logged and ignored.
-async function _freshenGraphifyGraphs(workspaceDir) {
+/**
+ * After the workspace is restored, run each registered tool's optional
+ * `workspace_hook` once per repo that satisfies its `requires_files` — e.g.
+ * refreshing a cached index. Best effort: never throws, never blocks the run.
+ */
+async function runToolWorkspaceHooks(tools, workspaceDir) {
   let entries
   try {
     entries = readdirSync(workspaceDir, { withFileTypes: true })
   } catch (e) {
-    console.warn('[pi-agent] graphify freshen: could not read workspace dir:', e.message)
+    console.warn('[pi-agent] workspace hooks: could not read workspace dir:', e.message)
     return
   }
   const dirs = entries.filter(e => e.isDirectory()).map(e => join(workspaceDir, e.name))
-  await Promise.allSettled(dirs.map((dir) => new Promise((resolve) => {
-    const graphPath = join(dir, 'graphify-out', 'graph.json')
-    if (!existsSync(graphPath)) return resolve()
+  const jobs = planWorkspaceHooks(tools, dirs)
+  if (jobs.length === 0) return
+  await Promise.allSettled(jobs.map(job => new Promise((resolve) => {
+    const { command, args, cwd, timeoutMs } = job
     let done = false
     const finish = () => { if (!done) { done = true; clearTimeout(timer); resolve() } }
-    const proc = spawn('graphify', ['update', '.'], { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] })
-    const timer = setTimeout(() => { try { proc.kill() } catch { /* already exited */ }; console.warn(`[pi-agent] graphify update timed out for ${dir}`); finish() }, 120000)
+    // Args come from the tool descriptor as an array — never a shell string.
+    const proc = spawn(command, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+    const timer = setTimeout(() => {
+      try { proc.kill() } catch { /* already exited */ }
+      console.warn(`[pi-agent] ${command} workspace hook timed out for ${cwd}`)
+      finish()
+    }, timeoutMs)
     let err = ''
     proc.stderr?.on('data', d => { err += d.toString() })
-    proc.on('error', e => { console.warn(`[pi-agent] graphify update failed for ${dir}:`, e.message); finish() })
-    proc.on('exit', code => { if (code !== 0) console.warn(`[pi-agent] graphify update exited (code ${code}) for ${dir}: ${err.trim().slice(0, 500)}`); finish() })
+    proc.on('error', e => {
+      console.warn(`[pi-agent] ${command} workspace hook failed for ${cwd}:`, e.message)
+      finish()
+    })
+    proc.on('exit', code => {
+      if (code !== 0) {
+        console.warn(`[pi-agent] ${command} workspace hook exited (code ${code}) for ${cwd}: ${err.trim().slice(0, 500)}`)
+      } else {
+        console.log(`[pi-agent] ${command} workspace hook ok for ${cwd}`)
+      }
+      finish()
+    })
   })))
 }
 
@@ -1788,21 +1674,12 @@ async function _executeMcpTool(mcpArgs) {
     }
   }
 
-  // semble's MCP server is stdio-only (its CLI rejects --transport/--port) so it
-  // is never pre-started as an HTTP server. When the resolver loop routes a
-  // semble tool call through here, there is no HTTP endpoint to hit — shell out
-  // to the semble CLI directly and return its stdout, matching the string-return
-  // contract of the HTTP path below. Scoped to semble; all other servers unchanged.
-  const isSembleCall = mcpArgs.server === 'semble' ||
-    (!mcpArgs.server && (toolName === 'search' || toolName === 'find_related' || toolName === 'find-related'))
-  if (isSembleCall) {
-    return await _runSembleCli(toolName, toolArgs)
-  }
-
-  // graphify is likewise CLI-only here (no per-repo HTTP MCP mode); route its
-  // calls to the CLI shim, matching the semble branch above.
-  if (isGraphifyToolCall(mcpArgs.server, toolName)) {
-    return await _runGraphifyCli(toolName, toolArgs)
+  // A registered tool may expose CLI-backed calls — a CLI-only tool has no
+  // HTTP MCP endpoint to hit, so route those to its command via the tool's own
+  // template, matching the string-return contract of the HTTP path below.
+  const cli = findCliTool(_registeredTools, mcpArgs.server, toolName)
+  if (cli) {
+    return await _runCliTool(cli.tool, cli.toolName, cli.spec, toolArgs)
   }
 
   const httpServer = Object.values(_mcpHttpServers)[0]

@@ -18,6 +18,13 @@ type MessageLike = {
 export interface ContextCollapseOptions {
     /** Text shorter than this is left alone. Defaults to `DEFAULT_MIN_CHARS`. */
     minChars?: number;
+    /**
+     * Tool-call arguments are collapsed only when their serialized JSON is
+     * strictly longer than this. Separate from `minChars` because argument
+     * collapse is lexical (no LLM call), so it is worth doing at a different
+     * size than an LLM summary. Defaults to `DEFAULT_ARG_COLLAPSE_MIN_CHARS`.
+     */
+    argMinChars?: number;
     /** Hard ceiling applied to any tool-result text that survives collapse. 0 disables. */
     maxToolResultChars?: number;
     /** Where displaced originals are written so the model can read them back. */

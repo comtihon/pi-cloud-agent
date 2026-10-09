@@ -80,9 +80,9 @@ RUN chmod +x /usr/local/bin/git-credential-env /usr/local/bin/seed-agent-home \
     && git config --system credential.helper env
 
 # ── acp-web-proxy (the container's entrypoint process) ────────────────────
-# Installed from a git checkout and built here: the repo does not commit
-# dist/ and has no `prepare` script, so `npm i -g github:comtihon/acp-web-proxy`
-# alone would install a package whose bin (dist/cli.js) does not exist.
+# Built from a git checkout (the repo does not commit dist/). The bin is
+# linked rather than `npm install -g`-ed: a global install of a local folder
+# re-runs the package's `prepare` (tsc) after devDependencies were pruned.
 ARG ACP_WEB_PROXY_REPO=https://github.com/comtihon/acp-web-proxy.git
 ARG ACP_WEB_PROXY_REF=main
 RUN git clone --depth 1 --branch "${ACP_WEB_PROXY_REF}" "${ACP_WEB_PROXY_REPO}" /opt/acp-web-proxy \
@@ -90,8 +90,9 @@ RUN git clone --depth 1 --branch "${ACP_WEB_PROXY_REF}" "${ACP_WEB_PROXY_REPO}" 
     && npm ci --no-audit --no-fund \
     && npm run build \
     && npm prune --omit=dev \
-    && npm install -g --no-audit --no-fund /opt/acp-web-proxy \
-    && command -v acp-web-proxy
+    && chmod +x dist/cli.js \
+    && ln -s /opt/acp-web-proxy/dist/cli.js /usr/local/bin/acp-web-proxy \
+    && acp-web-proxy --help >/dev/null
 COPY docker/acp-web-proxy.yaml /etc/acp-web-proxy/config.yaml
 
 # ── pi-carrier-agent (ACP agent on stdio, spawned by the proxy) ───────────

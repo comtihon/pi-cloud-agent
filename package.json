@@ -1,6 +1,6 @@
 {
   "name": "pi-carrier-agent",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "description": "ACP (Agent Client Protocol) agent on the pi SDK for ai-agents-carrier, served over WebSocket by acp-web-proxy",
   "license": "MIT",

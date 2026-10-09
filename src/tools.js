@@ -129,7 +129,7 @@ export function buildCliInvocation(spec, args = {}) {
 }
 
 /**
- * Find which registered tool serves an mcp() gateway call, by explicit
+ * Find which registered tool serves a CLI-tool call (carrier-cli-tools), by explicit
  * `server` name or by the tool name appearing in some tool's `cli_tools`.
  */
 export function findCliTool(registered, server, toolName) {

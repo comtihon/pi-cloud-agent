@@ -1,0 +1,18 @@
+# acp-web-proxy in the agent pod: carrier connects over WebSocket to
+# ws://<pod>:8000/acp and drives pi-carrier-agent (ACP on stdio) through it.
+listen:
+  host: 0.0.0.0
+  port: 8000
+  path: /acp
+# Carrier generates one token per pod and passes it as an env var at spawn
+# (helm: --set-string env.ACP_PROXY_TOKEN=<token>). Every ACP_PROXY_* var is
+# stripped from the agent's environment by the proxy.
+tokens: [env:ACP_PROXY_TOKEN]
+default_agent: pi
+idle_timeout_s: 900          # carrier restart / network blip window
+replay_buffer: 20000         # frames kept per connection for replay
+state_dir: /tmp/acp-web-proxy
+agents:
+  pi:
+    command: [pi-carrier-agent]
+    cwd: /workspace

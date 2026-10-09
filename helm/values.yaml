@@ -6,6 +6,7 @@ image:
   # Defaults to the chart appVersion prefixed with "v" when empty.
   tag: v0.1.5
 
+# acp-web-proxy serves GET /health on service.port.
 healthchecks:
   enabled: false
 
@@ -15,11 +16,13 @@ fullnameOverride: ""
 
 # Plain env vars injected into the container.
 #
-# ai-agents-carrier's K8sRuntime sets these at `helm upgrade --install` time:
-#   --set env.AGENT_PORT=8000
-#   --set env.BACKEND_CALLBACK_URL=<carrier base url>
-#   --set env.RUN_ID=<workflow run id>
-#   --set-string env.<KEY>=<value>   (one per agent_input env_var: API keys, etc.)
+# The container runs acp-web-proxy on service.port (8000), path /acp, which
+# spawns pi-carrier-agent (ACP over stdio). ai-agents-carrier's runtime sets at
+# `helm upgrade --install` time:
+#   --set-string env.ACP_PROXY_TOKEN=<fresh token per pod>   (required: the
+#                proxy rejects every WebSocket without it)
+#   --set-string env.<KEY>=<value>   (optional extra env; per-run tools,
+#                credentials, MCP servers and model arrive in ACP session/new)
 #
 # Keep this block as a flat map — nested values are dropped by the runtime.
 env: {}

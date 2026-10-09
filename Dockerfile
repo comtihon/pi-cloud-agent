@@ -1,13 +1,16 @@
-# pi-cloud-agent — the pi coding agent behind an HTTP control API.
+# pi-carrier-agent image — the pi coding agent as an ACP agent, served over
+# WebSocket by acp-web-proxy.
+#
+#   carrier ──ws://<pod>:8000/acp──► acp-web-proxy ──stdio (ACP)──► pi-carrier-agent (pi SDK)
 #
 # Build from the repo root:
 #
 #   docker build -t pi-cloud-agent .
 #
-# The backend runtime injects these env vars when spawning the container:
-#   AGENT_PORT            — TCP port the server listens on (default 8000)
-#   BACKEND_CALLBACK_URL  — backend base URL for callbacks
-#   RUN_ID                — workflow run identifier
+# The carrier runtime injects at spawn:
+#   ACP_PROXY_TOKEN — bearer token the proxy accepts (fresh per pod)
+# plus any extra env it forwards. Everything else (tools, credentials, MCP
+# servers, model, workspace bucket) arrives per session in `session/new`.
 
 FROM node:22-slim
 
@@ -76,23 +79,32 @@ RUN chmod +x /usr/local/bin/git-credential-env /usr/local/bin/seed-agent-home \
     && git config --system user.name "Agent" \
     && git config --system credential.helper env
 
-# ── Agent server Node app ─────────────────────────────────────────────────
-# vendor/ is copied before `npm ci` because pi-post-compact is a file:
-# dependency — the install fails outright if the directory is not there yet.
-COPY vendor ./vendor
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+# ── acp-web-proxy (the container's entrypoint process) ────────────────────
+# Installed from a git checkout and built here: the repo does not commit
+# dist/ and has no `prepare` script, so `npm i -g github:comtihon/acp-web-proxy`
+# alone would install a package whose bin (dist/cli.js) does not exist.
+ARG ACP_WEB_PROXY_REPO=https://github.com/comtihon/acp-web-proxy.git
+ARG ACP_WEB_PROXY_REF=main
+RUN git clone --depth 1 --branch "${ACP_WEB_PROXY_REF}" "${ACP_WEB_PROXY_REPO}" /opt/acp-web-proxy \
+    && cd /opt/acp-web-proxy \
+    && npm ci --no-audit --no-fund \
+    && npm run build \
+    && npm prune --omit=dev \
+    && npm install -g --no-audit --no-fund /opt/acp-web-proxy \
+    && command -v acp-web-proxy
+COPY docker/acp-web-proxy.yaml /etc/acp-web-proxy/config.yaml
 
-# ── pi-mcp-adapter + pi-post-compact (extensions loaded by pi SDK) ─────────
-# A SECOND install of the same vendored package, into the pi agent home. This
-# copy is what pi discovers and loads as an extension for native tool calls
-# (its `context` and `tool_result` hooks); the file: dependency installed above
-# is what src/runner.js imports directly for the mcp-resolver loop. Same code,
-# two consumers.
+# ── pi-carrier-agent (ACP agent on stdio, spawned by the proxy) ───────────
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund
+
+# ── pi-mcp-adapter + pi-post-compact (extensions loaded by pi) ────────────
+# settings.json lists them as `npm:` sources, which pi resolves to
+# $PI_CODING_AGENT_DIR/npm/node_modules/<name>.
 # Baked at PI_BAKED_AGENT_DIR, not at PI_CODING_AGENT_DIR: the latter is a
 # writable mount at runtime (pi writes settings.json / mcp.json / mcp-cache.json
-# / sessions/ there) and a mount would hide anything baked underneath it. The
-# entrypoint copies this tree in at start — see bin/seed-agent-home.
+# there) and a mount would hide anything baked underneath it. The entrypoint
+# copies this tree in at start — see bin/seed-agent-home.
 COPY vendor/pi-post-compact /opt/pi/agent/vendor/pi-post-compact
 RUN mkdir -p /opt/pi/agent/npm && \
     cd /opt/pi/agent/npm && \
@@ -100,14 +112,18 @@ RUN mkdir -p /opt/pi/agent/npm && \
     npm install pi-mcp-adapter@2.11.0 --legacy-peer-deps && \
     npm install /opt/pi/agent/vendor/pi-post-compact --legacy-peer-deps --install-links
 
+COPY bin/pi-carrier-agent ./bin/pi-carrier-agent
 COPY src ./src
+RUN chmod +x bin/pi-carrier-agent src/cli-tools-mcp.js \
+    && ln -s /app/bin/pi-carrier-agent /usr/local/bin/pi-carrier-agent
 
 # ── Non-root runtime ──────────────────────────────────────────────────────
 # `node` (uid/gid 1000) ships with the base image. Every path written at run
 # time lives under one of these three, so the root filesystem can be mounted
 # read-only: HOME (pi agent dir, kube cache, gcloud config), /tmp (credential
-# temp files, the disabled-command stubs) and /workspace (restored repos and
-# .tool_artifacts). The chart mounts an emptyDir over each; a plain
+# temp files, the disabled-command stubs, workspace archives, the proxy's
+# per-connection state) and /workspace (restored repos, pi session files in
+# /workspace/.pi-sessions, .tool_artifacts). The chart mounts an emptyDir over each; a plain
 # `docker run` gets the image's own writable copies instead.
 ENV HOME=/home/node \
     PI_CODING_AGENT_DIR=/home/node/.pi/agent \
@@ -123,4 +139,4 @@ USER node
 EXPOSE 8000
 
 ENTRYPOINT ["/usr/local/bin/seed-agent-home"]
-CMD ["node", "src/server.js"]
+CMD ["acp-web-proxy", "--config", "/etc/acp-web-proxy/config.yaml"]

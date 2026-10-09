@@ -13,6 +13,7 @@
 import { ASSISTANT_CONTENT_REASON, buildActionSummaryInstruction, compactOrKeep, DEFAULT_MIN_CHARS, } from "./compact.js";
 import { collapseStub } from "./artifacts.js";
 import { cacheFrontierIndex, summarizeToolCallArgs, truncateWithNotice } from "./collapse.js";
+import { DEFAULT_ARG_COLLAPSE_MIN_CHARS } from "./defaults.js";
 function isToolResult(msg) {
     return msg.role === "toolResult" && Array.isArray(msg.content);
 }
@@ -135,6 +136,7 @@ export class ContextCollapseEngine {
         this.roundTrip++;
         this.stats.roundTrip = this.roundTrip;
         const minChars = this.options.minChars ?? DEFAULT_MIN_CHARS;
+        const argMinChars = this.options.argMinChars ?? DEFAULT_ARG_COLLAPSE_MIN_CHARS;
         const maxChars = this.options.maxToolResultChars ?? 0;
         const artifacts = this.options.artifacts;
         const pending = new Set();
@@ -148,7 +150,7 @@ export class ContextCollapseEngine {
                 if (isAssistant(msg)) {
                     const key = assistantKey(msg, i);
                     await this.collapseAssistantContent(msg, key, { minChars, artifacts, deps, pending });
-                    await this.collapseToolCallArgs(msg, { minChars, artifacts, deps, pending });
+                    await this.collapseToolCallArgs(msg, { argMinChars, artifacts, deps, pending });
                 }
             }
         }
@@ -227,7 +229,7 @@ export class ContextCollapseEngine {
             if (!isToolCallBlock(block))
                 continue;
             const serialized = JSON.stringify(block.arguments ?? {});
-            if (serialized.length <= ctx.minChars)
+            if (serialized.length <= ctx.argMinChars)
                 continue;
             const id = `args-${block.id}`;
             this.seen(id);

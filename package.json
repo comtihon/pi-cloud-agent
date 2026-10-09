@@ -1,20 +1,21 @@
 {
-  "name": "pi-cloud-agent",
-  "version": "0.1.6",
+  "name": "pi-carrier-agent",
+  "version": "0.2.0",
   "private": true,
-  "description": "pi coding agent wrapped in an HTTP server, compatible with ai-agents-carrier",
+  "description": "ACP (Agent Client Protocol) agent on the pi SDK for ai-agents-carrier, served over WebSocket by acp-web-proxy",
   "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=22.19.0"
   },
+  "bin": {
+    "pi-carrier-agent": "bin/pi-carrier-agent"
+  },
   "scripts": {
-    "start": "node src/server.js",
+    "start": "node bin/pi-carrier-agent",
     "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
-    "express": "^4.21.2",
-    "@earendil-works/pi-coding-agent": "^0.79.6",
-    "pi-post-compact": "file:vendor/pi-post-compact"
+    "@earendil-works/pi-coding-agent": "^0.79.6"
   }
 }

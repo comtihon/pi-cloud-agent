@@ -1,6 +1,4 @@
-// Unit test for downloadWorkspace()'s stale-file cleanup (Bug 4 fix).
-// Uses only Node's built-in test runner + assert module — no new
-// dependencies, no mocking framework — matching runner_format.test.mjs.
+// Tests for the async workspace transfer (src/workspace.js).
 //
 // downloadWorkspace() shells out to the real `gsutil` binary directly (no
 // injectable exec function). Since there's no real GCS access here, we
@@ -20,9 +18,9 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { downloadWorkspace } from '../src/workspaceS3.js'
+import { downloadWorkspace, uploadWorkspace, runWorkspaceHooks } from '../src/workspace.js'
 
-test('downloadWorkspace clears stale local files before extracting the archive', () => {
+test('downloadWorkspace clears stale local files before extracting the archive', async () => {
   const workspaceDir = mkdtempSync(join(tmpdir(), 'workspace-'))
   const fixtureDir = mkdtempSync(join(tmpdir(), 'fixture-'))
   const binDir = mkdtempSync(join(tmpdir(), 'fakebin-'))
@@ -57,7 +55,7 @@ fi
 
     process.env.PATH = `${binDir}:${originalPath}`
 
-    const ok = downloadWorkspace({ s3_bucket: 'fake-bucket', s3_path: 'fake-path' }, workspaceDir)
+    const ok = await downloadWorkspace({ s3_bucket: 'fake-bucket', s3_path: 'fake-path' }, workspaceDir)
 
     assert.equal(ok, true)
     assert.equal(existsSync(join(workspaceDir, 'stale.txt')), false)
@@ -71,11 +69,11 @@ fi
   }
 })
 
-// Regression: the bucket/path in `extra` come straight off the /start request
+// Regression: the bucket/path in `extra` come straight off the session/new
 // payload. They used to be joined into a shell string, so a bucket containing
-// shell metacharacters executed. execFileSync passes an argv array instead, so
+// shell metacharacters executed. spawn() passes an argv array instead, so
 // the metacharacters must reach gsutil as literal argument text.
-test('downloadWorkspace does not let a malicious bucket name reach a shell', () => {
+test('downloadWorkspace does not let a malicious bucket name reach a shell', async () => {
   const workspaceDir = mkdtempSync(join(tmpdir(), 'workspace-'))
   const binDir = mkdtempSync(join(tmpdir(), 'fakebin-'))
   const canary = join(mkdtempSync(join(tmpdir(), 'canary-')), 'pwned')
@@ -91,7 +89,7 @@ test('downloadWorkspace does not let a malicious bucket name reach a shell', () 
     process.env.PATH = `${binDir}:${originalPath}`
 
     const malicious = `bkt; touch ${canary}; #`
-    const result = downloadWorkspace({ s3_bucket: malicious, s3_path: 'p' }, workspaceDir)
+    const result = await downloadWorkspace({ s3_bucket: malicious, s3_path: 'p' }, workspaceDir)
 
     assert.equal(result, false, 'the fake gsutil fails, so restore reports failure')
     assert.equal(existsSync(canary), false, 'injected command must never run')
@@ -106,5 +104,50 @@ test('downloadWorkspace does not let a malicious bucket name reach a shell', () 
     process.env.PATH = originalPath
     rmSync(workspaceDir, { recursive: true, force: true })
     rmSync(binDir, { recursive: true, force: true })
+  }
+})
+
+test('uploadWorkspace archives the workspace and returns the gs:// URI', async () => {
+  const workspaceDir = mkdtempSync(join(tmpdir(), 'workspace-'))
+  const binDir = mkdtempSync(join(tmpdir(), 'fakebin-'))
+  const sink = mkdtempSync(join(tmpdir(), 'sink-'))
+  const originalPath = process.env.PATH
+  try {
+    writeFileSync(join(workspaceDir, 'a.txt'), 'A')
+    const fakeGsutil = join(binDir, 'gsutil')
+    // `cp <local> <gs-uri>` → copy into the sink so the archive can be inspected.
+    writeFileSync(fakeGsutil, `#!/bin/sh\n[ "$1" = "cp" ] && cp "$2" ${sink}/out.tar.gz\n`)
+    chmodSync(fakeGsutil, 0o755)
+    process.env.PATH = `${binDir}:${originalPath}`
+
+    const uri = await uploadWorkspace({ s3_bucket: 'b', s3_path: 'runs/1' }, workspaceDir)
+    assert.equal(uri, 'gs://b/runs/1/workspace.tar.gz')
+    const listing = execSync(`tar tzf ${join(sink, 'out.tar.gz')}`).toString()
+    assert.match(listing, /a\.txt/)
+  } finally {
+    process.env.PATH = originalPath
+    rmSync(workspaceDir, { recursive: true, force: true })
+    rmSync(binDir, { recursive: true, force: true })
+    rmSync(sink, { recursive: true, force: true })
+  }
+})
+
+test('uploadWorkspace without a bucket configured is a no-op', async () => {
+  assert.equal(await uploadWorkspace({}, '/nonexistent'), null)
+})
+
+test('runWorkspaceHooks runs a hook per qualifying repo and never throws', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'ws-'))
+  try {
+    execSync(`mkdir -p ${root}/repo/.marker ${root}/plain`)
+    const tool = { name: 'toucher', command: 'touch', workspace_hook: { args: ['hooked'], requires_files: ['.marker'] } }
+    const jobs = await runWorkspaceHooks([tool], root)
+    assert.equal(jobs.length, 1)
+    assert.equal(jobs[0].code, 0)
+    assert.equal(existsSync(join(root, 'repo', 'hooked')), true)
+    assert.equal(existsSync(join(root, 'plain', 'hooked')), false)
+    assert.deepEqual(await runWorkspaceHooks([tool], join(root, 'missing')), [])
+  } finally {
+    rmSync(root, { recursive: true, force: true })
   }
 })

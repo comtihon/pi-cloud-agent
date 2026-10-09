@@ -1,115 +1,124 @@
-# pi-cloud-agent
+# pi-carrier-agent
 
-The [pi coding agent](https://github.com/earendil-works/pi) wrapped in an HTTP web server, so it
-can be spawned as a container/pod, driven over REST, and torn down when the job is done.
+The [pi coding agent](https://github.com/earendil-works/pi) as an
+[ACP](https://agentclientprotocol.com) (Agent Client Protocol) agent, built on the pi SDK
+in-process (`createAgentSession`), for
+[**ai-agents-carrier**](https://github.com/comtihon/ai-agents-carrier).
 
-It is a drop-in agent runtime for
-[**ai-agents-carrier**](https://github.com/comtihon/ai-agents-carrier) — the carrier's
-`langgraph-agent` / `claude-agent` workflow steps deploy this chart, `POST /start`, and poll for
-output. Nothing here is carrier-specific though: the HTTP contract is small enough to drive from
-anything.
+`pi-carrier-agent` speaks newline-delimited JSON-RPC 2.0 on stdin/stdout. In the agent pod it runs
+behind [**acp-web-proxy**](https://github.com/comtihon/acp-web-proxy), which serves it over
+WebSocket with bearer auth, reconnect-with-replay and an idle timeout:
 
-On top of plain pi, this image ships **token-consumption optimizations** (see below) built around
-[**pi-post-compact**](https://github.com/comtihon/pi-post-compact).
+```
+carrier ──ws://<pod>:8000/acp (ACP)──► acp-web-proxy ──stdio (ACP)──► pi-carrier-agent ──► pi SDK session
+                                                                       (tools, MCP, bash, git, kubectl…)
+```
+
+Context optimisations (tool-result compaction, truncation, artifacts, collapse) live in the
+[**pi-post-compact**](https://github.com/comtihon/pi-post-compact) pi extension, which pi loads
+like any other package — this repo no longer intercepts provider requests.
 
 ---
 
-## What it is
+## The ACP contract
 
-`src/server.js` is an Express app holding one pi agent session. `src/runner.js` runs that session
-in-process via the pi SDK (`createAgentSession`) — no pi CLI subprocess, no RPC layer. Progress and
-the final result are buffered in memory and drained by the caller's polling.
+Framing: one JSON object per line, split on `"\n"` only (not `readline`, which also breaks on
+U+2028/U+2029 inside JSON strings). stdout carries the protocol only; logs go to stderr.
 
-```
-carrier ──POST /start──▶ pi-cloud-agent ──▶ pi SDK session (tools, MCP, bash, git, kubectl…)
-        ◀──GET /poll────  (progress → final)
-```
-
-### HTTP API
-
-| Method | Path         | Purpose |
-| ------ | ------------ | ------- |
-| `GET`  | `/health`    | `{"status":"ok"}` — readiness/liveness. |
-| `GET`  | `/status`    | Internal status: `idle` \| `running` \| `done` \| `failed`. |
-| `GET`  | `/poll`      | Drains buffered outputs. Status is mapped to the carrier protocol (`idle`/`working`/`finished`/`failed`). Progress outputs are delivered once; `final` is re-sent on every poll so a dropped socket cannot lose the result. |
-| `POST` | `/start`     | Starts a run. `202` with `started`, or `already_processed` for a repeat `run_id`, or `409` while busy. |
-| `POST` | `/terminate` | Aborts the session and exits the process. |
-
-`POST /start` body:
+### `initialize`
 
 ```json
-{
-  "run_id": "…",
-  "task_id": "…",
-  "input": { },
-  "callback_url": "http://ai-agents-carrier.langgraph.svc.cluster.local:8000",
-  "agent_config": { "system_prompt": "…", "model": "…", "tools": [], "env_vars": {} }
-}
+{"protocolVersion": 1,
+ "agentCapabilities": {"loadSession": true,
+   "promptCapabilities": {"image": true, "audio": false, "embeddedContext": false},
+   "mcpCapabilities": {"http": true, "sse": true},
+   "_meta": {"carrier": {"version": "<pkg version>", "ask": true}}},
+ "agentInfo": {"name": "pi-carrier-agent", "version": "<pkg version>"},
+ "authMethods": []}
 ```
 
-`callback_url` is used for the interactive path: the agent `POST`s a clarification question to
-`{callback_url}/api/v1/runs/{run_id}/agent/question` and long-polls `…/agent/input` for the answer.
+### `session/new {cwd, mcpServers, _meta: {carrier: <agent_config>}}`
 
----
+`agent_config` is what carrier's `_build_agent_config` builds — `system_prompt`, `model`, `tools`,
+`blocked_commands`, `mcp_servers`, `credentials`, `extra`, `env_vars`, `expected_output_fields` —
+plus `run_id` / `task_id`. `mcpServers` is ACP-shaped, already converted by carrier:
+stdio `{name, command, args, env: [{name, value}]}`, http/sse
+`{type, name, url, headers: [{name, value}]}`.
 
-## Token consumption optimizations
+In order, the agent:
 
-A long agent run spends most of its tokens re-sending old tool output. This image cuts that down
-without losing the information the model actually needs.
+1. registers the granted tools that exist on `PATH`, installs their env (undoing the previous
+   session's), shadows `blocked_commands` with exit-127 stubs, and puts `credentials`, `env_vars`,
+   the LLM key (`extra.llm_api_key_env`) and `extra.llm_base_url` on the process env;
+2. materialises `*_JSON` service-account keys and activates gcloud;
+3. restores the workspace from `gs://<extra.s3_bucket>/<extra.s3_path>/workspace.tar.gz` into
+   `cwd` (default `/workspace`) and runs each tool's `workspace_hook` per repo — all async;
+4. pre-starts stdio MCP servers as local streamable-HTTP servers when carrier's matching
+   `mcp_servers` entry does not say `prestart_http: false` (waits for the port, falls back to stdio);
+5. writes pi-mcp-adapter's `mcp.json` from the ACP `mcpServers` (`Authorization: Bearer …` →
+   `bearerToken`), plus a `carrier-cli-tools` stdio server when any tool has `cli_tools`, and
+   `settings.json` with `packages: ["npm:pi-mcp-adapter", "npm:pi-post-compact"]`;
+6. creates the pi session (`cwd`, model via `resolveModelConfig` — `extra.context_window` /
+   `extra.max_tokens` for a custom endpoint, defaults 128000 / 16384), persisting the session file
+   under `<cwd>/.pi-sessions/` so it is archived with the workspace.
 
-The policy itself — thresholds, prompts, collapse timing, artifact handling — lives in
-[**pi-post-compact**](https://github.com/comtihon/pi-post-compact), which is both a pi extension and
-a library. That split is deliberate, because this image reduces tokens along two paths that share
-one implementation:
+`system_prompt` is a **real system prompt**: it is appended to pi's own system prompt through the
+resource loader (`appendSystemPromptOverride`) and sent as the provider's `system` message every
+turn — never prefixed to the user's text.
 
-| Path | Used for | Driven by |
+Result: `{sessionId, _meta: {carrier: {session_file}}}`.
+
+### `session/load {sessionId, cwd, mcpServers, _meta}`
+
+Re-applies the config, reopens the pi session file (`_meta.carrier.session_file`, or found by id in
+`<cwd>/.pi-sessions/`; if it is not on disk the workspace is restored from GCS first) and replays
+the history as `session/update` (`user_message_chunk`, `agent_message_chunk`,
+`agent_thought_chunk`, `tool_call`, `tool_call_update`) before responding.
+
+### `session/prompt {sessionId, prompt: ContentBlock[]}`
+
+Text and image blocks go to `session.prompt()` (resource links / text resources are inlined as
+text). While it runs, pi events stream as `session/update`:
+
+| pi event | ACP update |
+|---|---|
+| text delta | `agent_message_chunk` |
+| thinking delta | `agent_thought_chunk` |
+| tool execution start | `tool_call {toolCallId, title, kind, status: "in_progress", rawInput, _meta.carrier}` |
+| tool execution end | `tool_call_update {toolCallId, status: "completed"\|"failed", rawOutput (≤ 8000 chars), content}` |
+| assistant message end | `usage_update {used, size}` (context tokens / window) |
+
+`kind`: `read`, `edit` (edit/write), `execute` (bash), `search` (grep/find/ls), MCP tools →
+`fetch` (get/list/search/read/query… names) or `other`, with `_meta.carrier.mcp_server` /
+`mcp_tool`; bash calls carry `_meta.carrier.tools` (granted tools matched by `bash_match`).
+
+The workspace is uploaded **before** the response:
+
+```json
+{"stopReason": "end_turn" | "cancelled" | "max_tokens" | "refusal",
+ "_meta": {"carrier": {"usage": {"input_tokens", "output_tokens", "total_tokens"},
+                        "meta_usage": {"input_tokens", "output_tokens", "total_tokens"} | null,
+                        "workspace_path": "gs://…/workspace.tar.gz" | null,
+                        "final_text": "<last assistant text>"}}}
+```
+
+`usage` covers this prompt only. `meta_usage` is pi-post-compact's meta-LLM spend from its
+`post-compact:stats` event, or `null`. A model error answers JSON-RPC `-32603` with the same
+`_meta` in `error.data`.
+
+### `session/cancel` (notification)
+
+`session.abort()`; the pending `session/prompt` resolves with `stopReason: "cancelled"`.
+
+### Questions (agent → client requests)
+
+| pi extension UI | client request | expected result |
 |---|---|---|
-| pi extension (`tool_result` + `context` hooks) | native pi tool calls | pi's own agent loop |
-| direct library calls | the `mcp` gateway loop below | `src/runner.js` |
+| `select(title, options)` | `session/request_permission {sessionId, toolCall: {toolCallId, title}, options: [{optionId, name, kind: "allow_once"}…]}` | `{outcome: {outcome: "selected", optionId} \| {outcome: "cancelled"}}` |
+| `confirm(title, message)` | same, options `yes` (`allow_once`) / `no` (`reject_once`) | same |
+| `input` / `editor` | `_carrier/ask {sessionId, question}` | `{answer: string}` or `{cancelled: true}` |
 
-The gateway loop drives its own provider requests and never passes through pi's agent loop, so the
-extension's hooks never fire for it — hence the second consumer. Same code, same behavior.
-
-### What it does
-
-- **Tool-result compaction** — `mcp` and `bash` results are summarized by a cheap meta-LLM focused on
-  a caller-declared `reason`, instead of being carried verbatim. Results marked `exact: true`, or
-  shorter than the threshold, skip it; if the summary would not shrink the output, the raw text is
-  kept. Meta-LLM cost is accumulated per run and reported separately from the agent's own usage.
-- **Verbatim results collapse after first use** — a result the model needed verbatim is kept verbatim
-  for exactly one round-trip, then replaced by a one-sentence *finding* ("what did I learn"), which
-  compresses far harder than a description of the same output.
-- **Tool-call argument collapse** — large arguments (a full file body in a `write`) are replaced by a
-  lexical stub once the call has run. No LLM involved.
-- **Assistant content collapse** — oversized assistant messages collapse on later round-trips.
-- **Hard result ceiling** — anything still oversized is truncated.
-- **Single `mcp` gateway tool** — every MCP server's tools are reached through one
-  `mcp({tool, args, reason})` tool whose description is a flat name list (capped at 60), instead of
-  injecting a full JSON schema per tool into every request. The usage example is generated from the
-  tools actually configured for the run. This part is specific to this image.
-- **Cache-frontier bookkeeping** — tracks the first message still subject to rewriting, so everything
-  before it is stable and prompt-cacheable. Observability only; it does not attach `cache_control`.
-
-Displaced originals are written to `/workspace/.tool_artifacts` and named in the stub that replaces
-them, so nothing is unrecoverable — `read_artifact` inside the gateway loop, or an ordinary `read`
-on the native path.
-
-Note the tension: rewriting history invalidates a provider's cached prefix from the first rewritten
-message onward. The collapse delay bounds it, but on a provider you rely on for prompt caching this
-is worth measuring rather than assuming.
-
-### Tunables
-
-| Env var                        | Default | Effect |
-| ------------------------------ | ------- | ------ |
-| `MCP_COMPACT_MIN_CHARS`        | `800`   | Below this, a gateway-loop tool result is not summarized. |
-| `MCP_ARG_COLLAPSE_MIN_CHARS`   | `800`   | Below this, tool-call arguments are left alone. |
-| `MCP_TOOL_RESULT_MAX_CHARS`    | `20000` | Hard truncation ceiling for a tool result. |
-| `MCP_RESOLVER_CALL_TIMEOUT_MS` | `120000` | Timeout for one chained call in the gateway loop. |
-| `META_LLM_PROVIDER` / `META_LLM_MODEL` | — | Model used for summaries. Falls back to `anthropic/claude-haiku-4-5`. |
-
-If `pi-post-compact` cannot summarize — no credentials, provider error, empty response — every path
-falls back to the raw text rather than losing data.
+Unknown methods answer `-32601`; failures `-32603` with the message.
 
 ---
 
@@ -117,14 +126,16 @@ falls back to the raw text rather than losing data.
 
 | Env var                          | Purpose |
 | -------------------------------- | ------- |
-| `AGENT_PORT`                     | Listen port. Default `8000`. |
+| `ACP_PROXY_TOKEN`                | Bearer token acp-web-proxy accepts (required; stripped from the agent's env). |
+| `PI_CARRIER_DEFAULT_CWD`         | Session `cwd` when `session/new` omits it. Default `/workspace`. |
 | `ANTHROPIC_API_KEY`              | Anthropic provider credentials. |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL` | OpenAI-compatible provider (OpenRouter etc.). |
-| `META_LLM_PROVIDER`, `META_LLM_MODEL` | Model used for compaction summaries. |
+| `META_LLM_PROVIDER`, `META_LLM_MODEL` | Model pi-post-compact uses for compaction summaries. |
 | `GIT_TOKEN`, `GIT_TOKEN_<HOST>`  | Token for HTTPS git operations, read by the credential helper (see below). |
 | `GOOGLE_APPLICATION_CREDENTIALS` | GCS workspace persistence + `gcloud`/`kubectl`/`helm` access. |
 | `PI_CODING_AGENT_DIR`            | pi agent home, a writable mount. Default `$HOME/.pi/agent`; the image bakes its extensions at `PI_BAKED_AGENT_DIR` (`/opt/pi/agent`) and the entrypoint seeds this directory from it. |
 
+Normally all of these arrive per session in `session/new` (`credentials`, `env_vars`, tool `env`).
 Tool credentials are **not** configured on the image — they arrive per run with
 the tool that needs them (see [Per-run tool grants](#per-run-tool-grants)).
 
@@ -132,8 +143,8 @@ The image ships a general toolbox — `git`, `ripgrep`, `jq`, `gcloud`, `kubectl
 `helm`, `uv`/`uvx` and a couple of code-search CLIs — but shipping a binary is
 not the same as granting it: only the tools a run is granted are usable.
 
-Workspaces can be checkpointed to GCS between steps of a workflow (`src/workspaceS3.js`), which is
-how a multi-step run resumes on a fresh pod.
+Workspaces are checkpointed to GCS after every prompt (`src/workspace.js`), together with the pi
+session file, which is how a multi-step run — or `session/load` — resumes on a fresh pod.
 
 ---
 
@@ -179,12 +190,15 @@ does not ship degrades instead of failing the run.
 * **`env`** — exported to `process.env` so bash and subprocesses inherit it.
   The keys installed by the previous run are removed first, so on a warm pod a
   revoked tool cannot reuse the credentials of the run before it.
-* **`bash_match`** — regex marking which bash commands exercise this tool, used
-  for progress reporting.
-* **`cli_tools`** — CLI invocations exposed through the `mcp()` gateway, for a
-  tool with no MCP server of its own. `{name}` placeholders are filled from the
-  call arguments (`{name|fallback}` supplies a default), `cwd` sets the working
-  directory, and `requires_files` refuses the call unless those files exist.
+* **`bash_match`** — regex marking which bash commands exercise this tool,
+  reported as `_meta.carrier.tools` on the bash `tool_call` update.
+* **`cli_tools`** — CLI invocations exposed as MCP tools by the local
+  `carrier-cli-tools` stdio MCP server (`src/cli-tools-mcp.js`), for a tool with
+  no MCP server of its own; the model reaches them through pi-mcp-adapter like
+  any MCP tool (e.g. `carrier_cli_tools_<name>`). `{name}` placeholders are
+  filled from the call arguments (`{name|fallback}` supplies a default) and
+  define the input schema, `cwd` sets the working directory, and
+  `requires_files` refuses the call unless those files exist.
 * **`workspace_hook`** — a command run once per restored workspace repo before
   the agent starts, for a tool keeping a per-repo cache or index. It runs only
   in repos already containing every `requires_files` entry, so it refreshes an
@@ -198,12 +212,13 @@ Argv always comes from these descriptors as an array and is passed straight to
 
 ### MCP servers
 
-`mcp_servers` entries are either remote (`url`) or stdio (`command`). A stdio
-server is normally pre-started as a local HTTP server so `pi-mcp-adapter`
-connects instantly instead of racing a 15-30s subprocess boot. A server whose
-CLI cannot be re-hosted over HTTP (no `--transport`/`--port`) should be sent
-with **`"prestart_http": false`**; it is then wired as a plain stdio entry
-instead. Absent, the flag defaults to `true`.
+MCP servers arrive as ACP `mcpServers` in `session/new`. A stdio server is
+pre-started as a local streamable-HTTP server (`--transport streamable-http
+--port N`, then the port is polled) so `pi-mcp-adapter` connects instantly
+instead of racing a 15-30s subprocess boot — but only when carrier's own
+`_meta.carrier.mcp_servers` entry of the same name exists and does not say
+**`"prestart_http": false`** (a CLI with no `--transport`/`--port`); otherwise
+it is wired as a plain stdio entry.
 
 ### Git credentials
 
@@ -222,60 +237,66 @@ the helper stays silent — which is what revokes the access.
 ## Build & run
 
 ```bash
-# tests (Node 22+ required)
+# tests (Node 22+ required by the pi SDK; the tests themselves stub pi)
 npm ci
 npm test
 
-# container
+# the agent alone, on stdio
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}' | npx pi-carrier-agent
+
+# container: acp-web-proxy on :8000 (/acp, /health) spawning pi-carrier-agent
 docker build -t pi-cloud-agent .
-docker run --rm -p 8000:8000 -e ANTHROPIC_API_KEY=… pi-cloud-agent
+docker run --rm -p 8000:8000 -e ACP_PROXY_TOKEN=secret pi-cloud-agent
 curl localhost:8000/health
 ```
 
+The image installs acp-web-proxy from a git checkout and builds it there (`ACP_WEB_PROXY_REF`
+build arg, default `main`): the proxy repo does not commit `dist/` and has no `prepare` script, so a
+plain `npm i -g github:comtihon/acp-web-proxy` would install it without its `dist/cli.js`.
+The proxy config is `docker/acp-web-proxy.yaml` → `/etc/acp-web-proxy/config.yaml`.
+
 ## Deploy
 
-Published on every push to `main`:
+Published on every push to `main` (image and chart keep the `pi-cloud-agent` name):
 
 - Docker image — `ghcr.io/comtihon/pi-cloud-agent:v<version>` (plus `:latest`)
 - Helm chart — `oci://ghcr.io/comtihon/charts/pi-cloud-agent` version `<version>`
 
 ```bash
 helm upgrade --install my-agent oci://ghcr.io/comtihon/charts/pi-cloud-agent \
-  --set-string env.ANTHROPIC_API_KEY=…
+  --set-string env.ACP_PROXY_TOKEN=$(openssl rand -hex 16) \
+  --set healthchecks.enabled=true
 ```
 
 ### Wiring it into ai-agents-carrier
 
-Register an agent definition with `default_runtime: k8s` and point it at the chart:
-
-```json
-{
-  "id": "researcher-fast",
-  "default_runtime": "k8s",
-  "helm_chart": "oci://ghcr.io/comtihon/charts/pi-cloud-agent",
-  "helm_values": { "healthchecks.enabled": "true" },
-  "agent_input": { "system_prompt": "…", "model": "…", "env_vars": { } }
-}
-```
-
-The carrier's `K8sRuntime` runs `helm upgrade --install agent-<agent_id>-<run_id>` and injects
-`env.AGENT_PORT`, `env.BACKEND_CALLBACK_URL`, `env.RUN_ID`, and one `env.<KEY>` per
-`agent_input.env_vars` entry. The chart renders `.Values.env` as plain container env vars, so those
-overrides reach the process (`.Values.config` and `.Values.secrets` are also supported for static
-config and existing k8s Secrets).
+An agent definition with `protocol: acp` (carrier's ACP executor) and `default_runtime: k8s`
+pointing at the chart. The runtime sets `env.ACP_PROXY_TOKEN` (fresh per pod); the executor
+connects to `ws://<release>:8000/acp`, sends `initialize`, `session/new` with the agent_config in
+`_meta.carrier`, then `session/prompt`, answering `session/request_permission` and `_carrier/ask`.
+`.Values.env` is rendered as plain container env vars (`.Values.config` and `.Values.secrets` are
+also supported for static config and existing k8s Secrets).
 
 ## Layout
 
 ```
-src/            HTTP server, pi SDK runner, tool plumbing, backend client,
-                GCS workspace helpers
-bin/            git credential helper (reads tokens from the environment)
-test/           node:test suites
-vendor/         pi-post-compact — installed twice by the Dockerfile: as this
-                package's file: dependency (imported by src/runner.js) and into
-                the pi agent home (loaded by pi as an extension)
-helm/           Helm chart (published as an OCI artifact)
-Dockerfile      Node 22 + gcloud/kubectl/helm/uv toolbox image
+bin/pi-carrier-agent   entry point (ACP on stdio)
+src/main.js            wiring: stdout guard, connection, setup, session factory
+src/acp/protocol.js    "\n" framing + JSON-RPC peer (requests both ways, id correlation)
+src/acp/agent.js       ACP handlers: initialize, session/new|load|prompt|cancel, questions
+src/acp/updates.js     pi events/messages → session/update payloads
+src/config/env.js      agent_config → process env, tools, blocked commands
+src/config/mcp.js      ACP mcpServers → mcp.json, settings.json, MCP pre-start
+src/config/model.js    agent_config → pi model + auth
+src/config/index.js    one session/new's setup, in order
+src/pi-session.js      createAgentSession with the carrier system prompt and event bus
+src/workspace.js       async GCS restore/upload, gcloud activation, workspace hooks
+src/tools.js           tool registration, per-tool env, CLI templates, hook planning
+src/cli-tools-mcp.js   carrier-cli-tools: stdio MCP server for tools[].cli_tools
+docker/                acp-web-proxy config baked into the image
+bin/                   also: git credential helper, agent-home seeder
+vendor/                pi-post-compact, installed into the pi agent home as an extension
+helm/                  Helm chart (published as an OCI artifact)
 ```
 
 ## License
